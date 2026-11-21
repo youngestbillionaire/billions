@@ -1,6 +1,7 @@
 """Original Mech Royale policy using only the kit's map and observations."""
 
 import math
+import random
 from time import perf_counter
 from typing import ClassVar
 
@@ -85,6 +86,8 @@ class Bot:
         self.last_position = None
         self.stuck = 0
         self.strafe = 1 if hello["seed"] % 2 else -1
+        self.movement_random = random.Random(hello["seed"])
+        self.next_strafe = 0.0
 
     def act(self, obs):
         me = obs["self"]
@@ -175,8 +178,6 @@ class Bot:
         firing = combat[1] if combat else [False, False]
         aim = combat[0] if combat else self.look(obs, goal, near)
 
-        step, stuck_jump = self.steer(obs, goal, urgent, retreat)
-        speed = math.hypot(*step)
         energy = me["energy"]
         arming = (
             not self.armed
@@ -186,12 +187,14 @@ class Bot:
                 for _, p in self.pickup_memory.values()
             )
         )
-        boosting = speed > 0.35 and (
+        wants_boost = (
             (urgent and energy > 6)
             or (retreat and energy > 13)
             or (arming and energy > 52)
             or (self.last_damage + 1.5 > t and energy > 58)
         )
+        step, stuck_jump = self.steer(obs, goal, wants_boost, charging)
+        boosting = math.hypot(*step) > 0.35 and wants_boost
         if not me["grounded"] and not stuck_jump:
             boosting = False
         act.update(
@@ -347,7 +350,10 @@ class Bot:
             if hp > 0.73 and len(near) <= 2 and focus.get("hp", 1400) < 250:
                 ideal = min(ideal, 31)
             radial = clamp((distance - ideal) / 27, -0.98, 0.75)
-            sign = self.strafe * (1 if int(t / 2.7) % 2 else -1)
+            if t >= self.next_strafe:
+                self.strafe = -self.strafe
+                self.next_strafe = t + self.movement_random.uniform(0.85, 2.45)
+            sign = self.strafe
             return (
                 x + (ux * radial - uy * sign) * 24,
                 y + (uy * radial + ux * sign) * 24,
@@ -751,7 +757,7 @@ class Bot:
             return math.remainder(yaw + 1.34 * math.sin(t * 1.65), math.tau), 0.0
         return math.remainder(yaw + 0.68 * math.sin(t * 1.4), math.tau), 0.0
 
-    def steer(self, obs, goal, urgent, retreat):
+    def steer(self, obs, goal, wants_boost, charging):
         me, t = obs["self"], obs["t"]
         x, y, z = pos = me["pos"]
         radius, height = me["stats"]["radius"], me["stats"]["height"]
@@ -790,7 +796,9 @@ class Bot:
         else:
             self.route.clear()
         yaw = math.atan2(direction[1] - y, direction[0] - x)
-        speed = me["stats"]["boost_speed" if urgent or retreat else "walk_speed"]
+        stats = me["stats"]
+        speed = stats["boost_speed" if wants_boost and me["grounded"] else "walk_speed"]
+        accel = stats["ground_accel" if me["grounded"] else "air_accel"]
         projectiles = [
             p
             for p in obs["projectiles"]
@@ -798,6 +806,8 @@ class Bot:
         ][:12]
         if distance <= 1 and not projectiles:
             return (0.0, 0.0), False
+        scale = max(0.32, min(1.0, distance / 9))
+        desired_speed = speed * scale * (0.5 if charging else 1.0)
         best = (float("-inf"), (0.0, 0.0))
         for offset in self.offsets if me["grounded"] else self.offsets[:7]:
             heading = yaw + offset
@@ -814,7 +824,12 @@ class Bot:
                 0.06 * self.strafe if offset > 0 else 0.0
             )
             danger = self.projectile_risk(
-                projectiles, (x, y, z + height * 0.5), (ux * speed, uy * speed), radius
+                projectiles,
+                (x, y, z + height * 0.5),
+                me["vel"],
+                (ux * desired_speed, uy * desired_speed),
+                accel,
+                radius,
             )
             if not fits:
                 target_value -= 5.0
@@ -822,10 +837,9 @@ class Bot:
             if score > best[0]:
                 best = (score, (ux, uy))
         jump = me["grounded"] and self.stuck >= 5 and me["energy"] > 40 and distance > 9
-        scale = max(0.32, min(1.0, distance / 9))
         return (best[1][0] * scale, best[1][1] * scale), jump
 
-    def projectile_risk(self, projectiles, position, velocity, radius):
+    def projectile_risk(self, projectiles, position, velocity, desired, accel, radius):
         risk = 0.0
         for projectile in projectiles:
             dx, dy, dz = (projectile["pos"][i] - position[i] for i in range(3))
@@ -836,9 +850,22 @@ class Bot:
                 continue
             if abs(dz + projectile["vel"][2] * moment) > 7:
                 continue
-            miss = math.hypot(dx + vx * moment, dy + vy * moment)
-            if miss < radius + 3:
-                risk += 5 * (1.0 - miss / (radius + 3))
+            # Integrate acceleration until the desired velocity is reached.
+            correction = []
+            for current, target in zip(velocity[:2], desired):
+                change = target - current
+                ramp = min(moment, abs(change) / max(1, accel))
+                correction.append(
+                    math.copysign(0.5 * accel * ramp**2, change)
+                    + change * (moment - ramp)
+                )
+            miss = math.hypot(
+                dx + vx * moment - correction[0],
+                dy + vy * moment - correction[1],
+            )
+            clearance = radius + 2
+            if miss < clearance:
+                risk += 7 * (1.0 - miss / clearance)
         return risk
 
 
