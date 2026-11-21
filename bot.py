@@ -1,7 +1,7 @@
 """Original Mech Royale policy using only the kit's map and observations."""
 
 import math
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 import mechfight
 from arena import Arena
@@ -20,8 +20,20 @@ def clamp(value, low, high):
     return min(high, max(low, value))
 
 
+class Tactics(NamedTuple):
+    retreat_hp: float = 0.65
+    trade_loss: float = 165
+    rotation_buffer: float = 9
+    center_bias: float = 0.59
+    arming_range: float = 126
+    loot_distance_weight: float = 1
+    gun_range: float = 54
+    laser_range: float = 57
+
+
 class Bot:
     name = "Billions"
+    tactics = Tactics(0.617, 141.812, 8.855, 0.821, 141.485, 0.969, 56.114, 67.212)
     weapons: ClassVar = {"mortar": 0, "gun": 1, "lightning": 2, "laser": 3}
     upgrades: ClassVar = {
         "nanites": 10,
@@ -137,14 +149,20 @@ class Bot:
             and sum(math.dist(e["pos"][:2], pos[:2]) < 78 for e in near) >= 2
         )
         losing_trade = (
-            self.damage_window > max(165, self.hit_window * 1.25 + 80)
+            self.damage_window
+            > max(self.tactics.trade_loss, self.hit_window * 1.25 + 80)
             and hp < 0.82
             and (focus is None or focus["hp"] > 185)
         )
         if hp >= 0.88:
             self.recovering = False
         elif danger and (
-            hp < (0.71 if self.free_for_all else 0.65)
+            hp
+            < (
+                min(0.82, self.tactics.retreat_hp + 0.06)
+                if self.free_for_all
+                else self.tactics.retreat_hp
+            )
             or len(near) >= 3
             and hp < 0.80
             or losing_trade
@@ -155,7 +173,8 @@ class Bot:
         safe_radius = max(0.0, zone["next_radius"] - 16)
         travel = max(0.0, next_range - safe_radius) / max(1, stats["walk_speed"])
         urgent = not me["in_zone"] or (
-            next_range > safe_radius and travel + 9 >= zone["shrink_end"] - t
+            next_range > safe_radius
+            and travel + self.tactics.rotation_buffer >= zone["shrink_end"] - t
         )
         retreat = (self.recovering or crossfire) and not urgent and obs["alive"] > 2
         if self.free_for_all and focus and obs["alive"] > 3:
@@ -288,7 +307,7 @@ class Bot:
         center = zone["next_center"]
         radius = zone["next_radius"]
         t = obs["t"]
-        edge = min(160, max(0, radius * 0.59 - 7))
+        edge = min(160, max(0, radius * self.tactics.center_bias - 7))
         angle = self.anchor + self.strafe * (0.24 if near else 0.0)
         anchor = (
             center[0] + edge * math.cos(angle),
@@ -345,13 +364,14 @@ class Bot:
         ):
             arming = [
                 (
-                    math.dist(p["pos"][:2], (x, y)) - 7 * self.weapons[p["kind"]],
+                    self.tactics.loot_distance_weight * math.dist(p["pos"][:2], (x, y))
+                    - 7 * self.weapons[p["kind"]],
                     p["id"],
                     p,
                 )
                 for _, p in self.pickup_memory.values()
                 if self.want_weapon(p["kind"], available)
-                and math.dist(p["pos"][:2], (x, y)) < 126
+                and math.dist(p["pos"][:2], (x, y)) < self.tactics.arming_range
                 and abs(p["pos"][2] - z) < 5
                 and math.dist(p["pos"][:2], center) < radius + 18
             ]
@@ -363,7 +383,11 @@ class Bot:
             ux, uy = unit(ex - x, ey - y)
             secondary = {w["kind"] for w in me["weapons"] if w}
             ideal = (
-                34 if "lightning" in secondary else 57 if "laser" in secondary else 54
+                34
+                if "lightning" in secondary
+                else self.tactics.laser_range
+                if "laser" in secondary
+                else self.tactics.gun_range
             )
             if hp > 0.73 and len(near) <= 2 and focus.get("hp", 1400) < 250:
                 ideal = min(ideal, 31)
