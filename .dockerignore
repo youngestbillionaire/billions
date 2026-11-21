@@ -1,0 +1,5 @@
+**
+!Dockerfile
+!selector.py
+!coverage.json.gz
+!comparison_profiles.json.gz
