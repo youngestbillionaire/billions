@@ -1,6 +1,7 @@
 """Original Mech Royale policy using only the kit's map and observations."""
 
 import math
+from time import perf_counter
 from typing import ClassVar
 
 import mechfight
@@ -22,7 +23,7 @@ def clamp(value, low, high):
 
 class Bot:
     name = "Billions"
-    weapons: ClassVar = {"gun": 1, "lightning": 2, "mortar": 3, "laser": 4}
+    weapons: ClassVar = {"mortar": 0, "gun": 1, "lightning": 2, "laser": 3}
     upgrades: ClassVar = {
         "nanites": 10,
         "armor": 9,
@@ -67,6 +68,14 @@ class Bot:
         self.replan = -1.0
         self.last_damage = -100.0
         self.damage_bearing = None
+        self.recovering = False
+        self.cover = None
+        self.cover_refresh = -1.0
+        self.pickup_memory = {}
+        self.armed = False
+        self.enemy_health = {}
+        self.enemy_conflicts = set()
+        self.free_for_all = False
         self.last_position = None
         self.stuck = 0
         self.strafe = 1 if hello["seed"] % 2 else -1
@@ -76,6 +85,9 @@ class Bot:
         x, y, z = pos = me["pos"]
         t, zone = obs["t"], obs["zone"]
         stats = me["stats"]
+        held = {w["kind"] for w in me["weapons"] if w}
+        self.armed = bool(held.intersection({"laser", "lightning"}))
+        self.remember_pickups(obs, held)
         hp = me["hp"] / max(1, me["max_hp"])
         muzzle = (x, y, z + stats["muzzle_height"])
         if self.anchor is None:
@@ -90,12 +102,20 @@ class Bot:
             (m for m in obs["mechs"] if m["kind"] == "mech"),
             key=lambda m: math.dist(m["pos"][:2], pos[:2]),
         )
+        self.observe_enemy_combat(obs, enemies)
         near = [m for m in enemies if math.dist(m["pos"][:2], pos[:2]) < 115]
         focus = self.visible_target(near or enemies, muzzle, hp)
         danger = t - self.last_damage < 2.2 or bool(near)
-        retreat = hp < 0.62 and danger
-        if len(near) >= 3 and hp < 0.85:
-            retreat = True
+        crossfire = (
+            self.free_for_all
+            and sum(math.dist(e["pos"][:2], pos[:2]) < 78 for e in near) >= 2
+        )
+        if hp >= 0.90:
+            self.recovering = False
+        elif danger and (
+            hp < (0.71 if self.free_for_all else 0.65) or len(near) >= 3 and hp < 0.80
+        ):
+            self.recovering = True
         next_center = zone["next_center"]
         next_range = math.dist(pos[:2], next_center)
         safe_radius = max(0.0, zone["next_radius"] - 16)
@@ -103,12 +123,27 @@ class Bot:
         urgent = not me["in_zone"] or (
             next_range > safe_radius and travel + 9 >= zone["shrink_end"] - t
         )
+        retreat = (self.recovering or crossfire) and not urgent and obs["alive"] > 2
+        if self.free_for_all and focus and obs["alive"] > 3:
+            distance = math.dist(focus["pos"][:2], pos[:2])
+            low = focus.get("hp", 1400) < 0.55 * focus.get("max_hp", 1400)
+            bearing = math.atan2(y - focus["pos"][1], x - focus["pos"][0])
+            distracted = (
+                "aim" in focus and abs(angle_delta(bearing, focus["aim"][0])) > 1.05
+            )
+            if (
+                distance > 48
+                and not (low and hp > 0.60)
+                and not (distracted and distance < 94 and not crossfire)
+                and t - self.last_damage > 1.3
+            ):
+                focus = None
         goal, can_farm = self.destination(obs, hp, near, focus, urgent, retreat)
         act = {"tick": obs["tick"]}
         if obs.get("offer"):
             act["pick"] = max(
                 range(len(obs["offer"]["choices"])),
-                key=lambda i: self.upgrades.get(obs["offer"]["choices"][i]["id"], 0),
+                key=lambda i: self.upgrade_value(obs["offer"]["choices"][i]["id"]),
             )
         self.collect_weapon(obs, act)
 
@@ -126,9 +161,18 @@ class Bot:
         step, stuck_jump = self.steer(obs, goal, urgent, retreat)
         speed = math.hypot(*step)
         energy = me["energy"]
+        arming = (
+            not self.armed
+            and not danger
+            and any(
+                self.want_weapon(p["kind"], held) and math.dist(p["pos"][:2], goal) < 2
+                for _, p in self.pickup_memory.values()
+            )
+        )
         boosting = speed > 0.35 and (
             (urgent and energy > 6)
             or (retreat and energy > 13)
+            or (arming and energy > 52)
             or (self.last_damage + 1.5 > t and energy > 58)
         )
         if not me["grounded"] and not stuck_jump:
@@ -142,6 +186,41 @@ class Bot:
         ):
             act["reload"] = not bool(focus) and not danger
         return act
+
+    def upgrade_value(self, name):
+        value = self.upgrades.get(name, 0)
+        if self.free_for_all and name in {"armor", "plating"}:
+            value += 3
+        return value
+
+    def observe_enemy_combat(self, obs, enemies):
+        if self.free_for_all:
+            return
+        t = obs["t"]
+        zone = obs["zone"]
+        own_hits = {
+            event.get("target") for event in obs["events"] if event["type"] == "hit"
+        }
+        npcs = [other for other in obs["mechs"] if other["kind"] == "npc"]
+        for enemy in enemies:
+            if "hp" not in enemy:
+                continue
+            index = enemy["id"]
+            previous = self.enemy_health.get(index)
+            current = enemy["hp"]
+            self.enemy_health[index] = (t, current)
+            if (
+                previous
+                and t - previous[0] < 0.24
+                and previous[1] - current >= 34
+                and index not in own_hits
+                and math.dist(enemy["pos"][:2], zone["center"]) < zone["radius"] - 15
+                and all(
+                    math.dist(enemy["pos"][:2], npc["pos"][:2]) > 55 for npc in npcs
+                )
+            ):
+                self.enemy_conflicts.add(index)
+        self.free_for_all = len(self.enemy_conflicts) >= 2
 
     def visible_target(self, enemies, muzzle, hp):
         candidates = []
@@ -180,8 +259,16 @@ class Bot:
             if inward > max(8, radius - 38):
                 return center, False
             return anchor, False
+        drop_goal = self.supply_goal(obs, hp, near)
+        if drop_goal is not None:
+            return drop_goal, False
 
         if retreat:
+            if self.last_damage + 2.2 < t and not near:
+                return (x, y), False
+            cover = self.find_cover(obs, near)
+            if cover is not None:
+                return cover, False
             ax, ay = 0.0, 0.0
             for enemy in near[:5]:
                 px, py = enemy["pos"][:2]
@@ -203,16 +290,29 @@ class Bot:
                 )
             return escape, False
 
-        for drop in sorted(obs["drops"], key=lambda d: math.dist(d["pos"][:2], (x, y))):
-            px, py, pz = drop["pos"]
-            distance = math.hypot(px - x, py - y)
-            if (
-                distance < (92 if hp < 0.9 else 58)
-                and drop["lands_in"] <= max(2, distance / 13)
-                and not any(math.dist(e["pos"][:2], (px, py)) < 26 for e in near)
-                and abs(z - pz) < 9
-            ):
-                return (px, py), False
+        if self.free_for_all:
+            cubes = self.safe_cubes(obs, near)
+            if cubes is not None:
+                return cubes, False
+
+        available = {w["kind"] for w in me["weapons"] if w}
+        if not self.armed and not any(
+            math.dist(e["pos"][:2], (x, y)) < (30 if hp > 0.7 else 40) for e in near
+        ):
+            arming = [
+                (
+                    math.dist(p["pos"][:2], (x, y)) - 7 * self.weapons[p["kind"]],
+                    p["id"],
+                    p,
+                )
+                for _, p in self.pickup_memory.values()
+                if self.want_weapon(p["kind"], available)
+                and math.dist(p["pos"][:2], (x, y)) < 126
+                and abs(p["pos"][2] - z) < 5
+                and math.dist(p["pos"][:2], center) < radius + 18
+            ]
+            if arming:
+                return tuple(min(arming)[2]["pos"][:2]), False
 
         if focus and (distance := math.dist(focus["pos"][:2], (x, y))) < 90:
             ex, ey = focus["pos"][:2]
@@ -221,6 +321,8 @@ class Bot:
             ideal = (
                 34 if "lightning" in secondary else 57 if "laser" in secondary else 54
             )
+            if hp > 0.73 and len(near) <= 2 and focus.get("hp", 1400) < 250:
+                ideal = min(ideal, 31)
             radial = clamp((distance - ideal) / 27, -0.98, 0.75)
             sign = self.strafe * (1 if int(t / 2.7) % 2 else -1)
             return (
@@ -228,12 +330,11 @@ class Bot:
                 y + (uy * radial + ux * sign) * 24,
             ), False
 
-        available = {w["kind"] for w in me["weapons"] if w}
         options = []
         for pool, value, category in (
             (obs["cubes"], 34, "cube"),
-            (obs["pickups"], 40, "weapon"),
-            (obs["crates"], 11, "crate"),
+            ((p for _, p in self.pickup_memory.values()), 40, "weapon"),
+            (obs["crates"], 29 if self.free_for_all else 11, "crate"),
         ):
             for item in pool:
                 if category == "weapon" and not self.want_weapon(
@@ -249,7 +350,8 @@ class Bot:
                 ):
                     if (
                         category == "crate"
-                        and distance < 35
+                        and distance < 14
+                        and hp > 0.70
                         and self.arena.clear(
                             (x, y, z + me["stats"]["muzzle_height"]), (px, py, pz + 2)
                         )
@@ -267,13 +369,128 @@ class Bot:
             ), True
         return anchor, True
 
+    def remember_pickups(self, obs, held):
+        t = obs["t"]
+        pos = obs["self"]["pos"]
+        visible = {p["id"] for p in obs["pickups"]}
+        for key, (seen, pickup) in list(self.pickup_memory.items()):
+            if (
+                t - seen > 24
+                or not self.want_weapon(pickup["kind"], held)
+                or (key not in visible and math.dist(pickup["pos"], pos) < 7)
+            ):
+                del self.pickup_memory[key]
+        for pickup in obs["pickups"]:
+            if self.want_weapon(pickup["kind"], held):
+                self.pickup_memory[pickup["id"]] = (t, pickup)
+
+    def safe_cubes(self, obs, enemies):
+        x, y, z = obs["self"]["pos"]
+        if any(math.dist(e["pos"][:2], (x, y)) < 25 for e in enemies):
+            return None
+        zone = obs["zone"]
+        options = []
+        for item in obs["cubes"]:
+            px, py, pz = item["pos"]
+            distance = math.hypot(px - x, py - y)
+            if (
+                distance > 42
+                or abs(pz - z) > 5
+                or math.dist((px, py), zone["next_center"])
+                > max(4, zone["next_radius"] - 5)
+                or any(math.dist(e["pos"][:2], (px, py)) < 33 for e in enemies)
+            ):
+                continue
+            cluster = sum(
+                math.dist(item["pos"], other["pos"]) <= 5 for other in obs["cubes"]
+            )
+            options.append((distance - min(5, cluster) * 4, item["id"], (px, py)))
+        return min(options)[2] if options else None
+
+    def supply_goal(self, obs, hp, threats):
+        me, zone = obs["self"], obs["zone"]
+        x, y, z = me["pos"]
+        options = []
+        for drop in obs["drops"]:
+            px, py, pz = drop["pos"]
+            distance = math.hypot(px - x, py - y)
+            if (
+                distance > (115 if hp < 0.9 else 78)
+                or abs(z - pz) > 9
+                or drop["lands_in"] > max(3, distance / 12)
+                or math.dist((px, py), zone["next_center"])
+                > max(6, zone["next_radius"] - 6)
+                or any(math.dist(e["pos"][:2], (px, py)) < 31 for e in threats)
+            ):
+                continue
+            if drop["holder"] == me["id"] and distance + 2 < drop["radius"]:
+                return x, y
+            options.append((distance, drop["id"], (px, py)))
+        return min(options)[2] if options else None
+
+    def find_cover(self, obs, enemies):
+        me, zone, t = obs["self"], obs["zone"], obs["t"]
+        x, y, z = me["pos"]
+        if t < self.cover_refresh:
+            return self.cover
+        self.cover_refresh = t + 0.55
+        enemies = [
+            (e["pos"][0], e["pos"][1], e["pos"][2] + 7 * (1 + 0.05 * e.get("cubes", 0)))
+            for e in enemies[:3]
+        ]
+        if not enemies and self.damage_bearing is not None:
+            yaw = self.damage_bearing
+            enemies = [(x + 44 * math.cos(yaw), y + 44 * math.sin(yaw), z + 7)]
+        if not enemies:
+            self.cover = None
+            return None
+        torso = me["stats"]["height"] * 0.58
+        visible_now = sum(
+            self.arena.clear(enemy, (x, y, z + torso)) for enemy in enemies
+        )
+        if visible_now == 0:
+            self.cover = (x, y)
+            return self.cover
+        best = None
+        deadline = perf_counter() + 0.006
+        away = math.atan2(y - enemies[0][1], x - enemies[0][0])
+        zone_limit = zone["radius"] - max(5.0, zone["dps"] * 0.075)
+        for radius in (12, 25, 39):
+            for offset in (0.0, -0.7, 0.7, -1.4, 1.4, -2.1, 2.1):
+                if perf_counter() >= deadline:
+                    break
+                px = x + radius * math.cos(away + offset)
+                py = y + radius * math.sin(away + offset)
+                if math.dist((px, py), zone["center"]) >= zone_limit:
+                    continue
+                pz = self.arena.ground(px, py)
+                if not self.arena.can_stand(
+                    px, py, pz, me["stats"]["radius"], me["stats"]["height"]
+                ):
+                    continue
+                exposed = sum(
+                    self.arena.clear(enemy, (px, py, pz + torso)) for enemy in enemies
+                )
+                if exposed >= visible_now:
+                    continue
+                progress = math.dist((px, py), zone["next_center"]) - math.dist(
+                    (x, y), zone["next_center"]
+                )
+                score = 24 * exposed + 0.45 * radius + 0.16 * max(0, progress)
+                if best is None or score < best[0]:
+                    best = (score, (px, py))
+            if best and best[0] < 14:
+                break
+        self.cover = best[1] if best else None
+        return self.cover
+
     def want_weapon(self, kind, held):
         return (
             kind not in held
             and self.weapons.get(kind, 0) > 1
             and (
                 len(held) < 2
-                or self.weapons[kind] > min(self.weapons[k] for k in held if k != "gun")
+                or self.weapons[kind] > min(self.weapons.get(k, 0) for k in held)
             )
         )
 
@@ -292,16 +509,18 @@ class Bot:
             return
         item = max(eligible, key=lambda p: self.weapons[p["kind"]])
         if None not in me["weapons"]:
-            slots = [
-                i
-                for i, w in enumerate(me["weapons"])
-                if w["kind"] != "gun" and not w.get("charge")
-            ]
+            slots = [i for i, w in enumerate(me["weapons"]) if not w.get("charge")]
             if not slots:
                 return
-            act["drop"] = min(
+            replacement = min(
                 slots, key=lambda i: self.weapons[me["weapons"][i]["kind"]]
             )
+            if (
+                self.weapons[me["weapons"][replacement]["kind"]]
+                >= self.weapons[item["kind"]]
+            ):
+                return
+            act["drop"] = replacement
         act["take"] = item["id"]
 
     def farm_target(self, obs, muzzle):
@@ -364,7 +583,10 @@ class Bot:
             yaw_error = abs(angle_delta(yaw, current[0]))
             pitch_error = abs(pitch - current[1])
             aim_error = max(yaw_error, pitch_error)
-            aligned = aim_error < tolerance
+            aligned = (
+                yaw_error < tolerance + limits["turn_rate"] * self.dt * 0.38
+                and pitch_error < tolerance + limits["pitch_rate"] * self.dt * 0.38
+            )
             ready = weapon["cooldown"] <= max(0.0, self.dt - 0.015)
             fire = ready and aligned
             score = {"gun": 1.8, "lightning": 2.75, "laser": 2.65, "mortar": 2.2}[
@@ -474,6 +696,8 @@ class Bot:
             if noise["kind"] in tactical and noise["dist"] == "near":
                 return noise["bearing"], 0.0
         yaw = math.atan2(goal[1] - y, goal[0] - x)
+        if not self.armed and not self.pickup_memory:
+            return math.remainder(yaw + 1.34 * math.sin(t * 1.65), math.tau), 0.0
         return math.remainder(yaw + 0.68 * math.sin(t * 1.4), math.tau), 0.0
 
     def steer(self, obs, goal, urgent, retreat):
