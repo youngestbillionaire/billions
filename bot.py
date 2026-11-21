@@ -61,13 +61,19 @@ class Bot:
     def __init__(self, hello):
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"])
-        self.dt = self.config["match"]["decide_every"] / self.config["match"]["tick_hz"]
+        self.sim_step = 1 / self.config["match"]["tick_hz"]
+        self.dt = self.config["match"]["decide_every"] * self.sim_step
         self.anchor = None
         self.route = []
         self.route_goal = None
         self.replan = -1.0
         self.last_damage = -100.0
         self.damage_bearing = None
+        self.attacker_id = None
+        self.focus_id = None
+        self.laser_blocked_until = -1.0
+        self.last_laser_aim = None
+        self.last_laser_target_time = -1.0
         self.recovering = False
         self.cover = None
         self.cover_refresh = -1.0
@@ -97,6 +103,11 @@ class Bot:
         for event in obs["events"]:
             if event["type"] == "damaged" and event.get("bearing") is not None:
                 self.last_damage, self.damage_bearing = t, event["bearing"]
+                self.attacker_id = event.get("by")
+            if event["type"] == "effect" and event.get("effect") == "short":
+                self.laser_blocked_until = (
+                    t + self.config["weapons"]["lightning"]["short_s"]
+                )
 
         enemies = sorted(
             (m for m in obs["mechs"] if m["kind"] == "mech"),
@@ -104,7 +115,13 @@ class Bot:
         )
         self.observe_enemy_combat(obs, enemies)
         near = [m for m in enemies if math.dist(m["pos"][:2], pos[:2]) < 115]
-        focus = self.visible_target(near or enemies, muzzle, hp)
+        charging = any(
+            w and w["kind"] == "laser" and w.get("charge", 0) > 0 for w in me["weapons"]
+        )
+        focus = self.visible_target(
+            near or enemies, muzzle, hp, me["aim"][0], t, charging
+        )
+        self.focus_id = focus["id"] if focus else None
         danger = t - self.last_damage < 2.2 or bool(near)
         crossfire = (
             self.free_for_all
@@ -154,7 +171,7 @@ class Bot:
             vulnerable = focus.get("hp", 1400) < 160
             if not close and not vulnerable:
                 focus = None
-        combat = self.choose_shot(focus, me, muzzle, retreat, obs["alive"])
+        combat = self.choose_shot(focus, me, muzzle, retreat, obs["alive"], t, urgent)
         firing = combat[1] if combat else [False, False]
         aim = combat[0] if combat else self.look(obs, goal, near)
 
@@ -222,7 +239,7 @@ class Bot:
                 self.enemy_conflicts.add(index)
         self.free_for_all = len(self.enemy_conflicts) >= 2
 
-    def visible_target(self, enemies, muzzle, hp):
+    def visible_target(self, enemies, muzzle, hp, yaw, t, charging):
         candidates = []
         for enemy in enemies[:6]:
             x, y, z = enemy["pos"]
@@ -235,6 +252,12 @@ class Bot:
             health = enemy.get("hp", 1400)
             prey = max(0, 1 - health / 1400)
             score = distance - (65 if hp > 0.55 else 35) * prey
+            bearing = math.atan2(y - muzzle[1], x - muzzle[0])
+            score += 12 * abs(angle_delta(bearing, yaw))
+            if enemy["id"] == self.focus_id:
+                score -= 17 if charging else 7
+            if enemy["id"] == self.attacker_id and t - self.last_damage < 0.8:
+                score -= 11
             if enemy.get("charging") and distance < 65:
                 score -= 22
             candidates.append((score, enemy["id"], enemy))
@@ -535,19 +558,26 @@ class Bot:
         drones = (e for e in obs["mechs"] if e["kind"] == "npc")
         return next((e for e in drones if math.dist(e["pos"], muzzle) < 33), None)
 
-    def choose_shot(self, target, me, muzzle, retreat, alive):
+    def choose_shot(self, target, me, muzzle, retreat, alive, t, urgent):
         weapons = me["weapons"]
         if not target:
             charged = [
                 bool(
                     w
                     and w["kind"] == "laser"
-                    and w.get("charge", 0) < 0.1
                     and w.get("charge", 0) > 0
+                    and (
+                        w["charge"] < 0.1
+                        or (
+                            not retreat
+                            and not urgent
+                            and t - self.last_laser_target_time <= 0.25
+                        )
+                    )
                 )
                 for w in weapons
             ]
-            return (me["aim"], charged) if any(charged) else None
+            return (self.last_laser_aim or me["aim"], charged) if any(charged) else None
         kind = target["kind"]
         center_height = (
             2.0
@@ -564,6 +594,8 @@ class Bot:
             kind_w = weapon["kind"]
             stats = weapon["stats"]
             charging = kind_w == "laser" and weapon.get("charge", 0) > 0
+            if kind_w == "laser" and t < self.laser_blocked_until:
+                continue
             if weapon["cooldown"] > 0.32 and not charging:
                 continue
             if kind_w == "gun" and (weapon["reload"] > 0.02 or not weapon["ammo"]):
@@ -578,14 +610,23 @@ class Bot:
             if prediction is None:
                 continue
             yaw, pitch, distance, tolerance = prediction
-            if not limits["min_pitch"] <= pitch <= limits["max_pitch"]:
+            if kind_w == "lightning":
+                pitch = clamp(pitch, limits["min_pitch"], limits["max_pitch"])
+            elif not limits["min_pitch"] <= pitch <= limits["max_pitch"]:
                 continue
             yaw_error = abs(angle_delta(yaw, current[0]))
             pitch_error = abs(pitch - current[1])
-            aim_error = max(yaw_error, pitch_error)
-            aligned = (
-                yaw_error < tolerance + limits["turn_rate"] * self.dt * 0.38
-                and pitch_error < tolerance + limits["pitch_rate"] * self.dt * 0.38
+            aim_error = (
+                yaw_error if kind_w == "lightning" else max(yaw_error, pitch_error)
+            )
+            slew = self.sim_step * (
+                0.75
+                if weapon["cooldown"] <= self.sim_step or kind_w == "laser"
+                else 1.65
+            )
+            aligned = yaw_error < tolerance + limits["turn_rate"] * slew and (
+                kind_w == "lightning"
+                or pitch_error < tolerance + limits["pitch_rate"] * slew
             )
             ready = weapon["cooldown"] <= max(0.0, self.dt - 0.015)
             fire = ready and aligned
@@ -593,6 +634,8 @@ class Bot:
                 kind_w
             ]
             if kind_w == "laser":
+                self.last_laser_aim = (yaw, pitch)
+                self.last_laser_target_time = t
                 charge = weapon.get("charge", 0)
                 if retreat and not charging and alive > 3:
                     continue
@@ -627,10 +670,12 @@ class Bot:
         fire[index] = trigger
         for _, other, other_yaw, other_pitch, wants_fire, tol in candidates:
             if other != index and weapons[other]["kind"] != "laser":
+                yaw_matches = abs(angle_delta(yaw, other_yaw)) < tol
+                pitch_matches = abs(pitch - other_pitch) < tol
                 fire[other] = (
                     wants_fire
-                    and max(abs(angle_delta(yaw, other_yaw)), abs(pitch - other_pitch))
-                    < tol
+                    and yaw_matches
+                    and (pitch_matches or weapons[other]["kind"] == "lightning")
                 )
         return (yaw, pitch), fire
 
@@ -686,6 +731,12 @@ class Bot:
     def look(self, obs, goal, near):
         x, y = obs["self"]["pos"][:2]
         t = obs["t"]
+        if (
+            self.damage_bearing is not None
+            and t - self.last_damage < 0.6
+            and abs(angle_delta(self.damage_bearing, obs["self"]["aim"][0])) > 1.35
+        ):
+            return self.damage_bearing, 0.0
         if near:
             ex, ey = near[0]["pos"][:2]
             return math.atan2(ey - y, ex - x), 0.0
