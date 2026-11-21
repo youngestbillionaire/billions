@@ -119,7 +119,14 @@ class Bot:
             w and w["kind"] == "laser" and w.get("charge", 0) > 0 for w in me["weapons"]
         )
         focus = self.visible_target(
-            near or enemies, muzzle, hp, me["aim"][0], t, charging
+            near or enemies,
+            muzzle,
+            hp,
+            me["aim"][0],
+            t,
+            charging,
+            next((w for w in me["weapons"] if w and w["kind"] == "lightning"), None),
+            me["energy"],
         )
         self.focus_id = focus["id"] if focus else None
         danger = t - self.last_damage < 2.2 or bool(near)
@@ -181,6 +188,15 @@ class Bot:
         combat = self.choose_shot(focus, me, muzzle, retreat, obs["alive"], t, urgent)
         firing = combat[1] if combat else [False, False]
         aim = combat[0] if combat else self.look(obs, goal, near)
+        if (
+            not self.free_for_all
+            and not any(firing)
+            and not charging
+            and t - self.last_damage < 0.45
+            and self.damage_bearing is not None
+            and abs(angle_delta(self.damage_bearing, aim[0])) > 1.55
+        ):
+            aim = (self.damage_bearing, aim[1])
 
         step, stuck_jump = self.steer(obs, goal, urgent, retreat)
         speed = math.hypot(*step)
@@ -204,12 +220,41 @@ class Bot:
         act.update(
             move=list(step), aim=list(aim), fire=firing, boost=boosting, jump=stuck_jump
         )
-        if any(
-            w and w["kind"] == "gun" and 0 < w["ammo"] < 4 and not w["reload"]
-            for w in me["weapons"]
-        ):
-            act["reload"] = not bool(focus) and not danger
+        if not focus and self.safe_reload(obs, near, muzzle, act, danger):
+            act["reload"] = True
         return act
+
+    def safe_reload(self, obs, near, muzzle, act, danger):
+        me = obs["self"]
+        for slot, gun in enumerate(me["weapons"]):
+            if not gun or gun["kind"] != "gun":
+                continue
+            if act["fire"][slot] or act.get("drop") == slot or gun["reload"]:
+                return False
+            ammo = gun["ammo"]
+            if 0 < ammo < 4 and not danger:
+                return True
+            if not 0 < ammo <= gun["stats"]["mag"] // 2:
+                return False
+            break
+        else:
+            return False
+        if not me["in_zone"] or obs["t"] - self.last_damage < 1.9:
+            return False
+        if any(
+            noise["dist"] == "near"
+            and noise["kind"] in {"laser_charge", "lightning", "gun", "mortar", "boost"}
+            for noise in obs["sounds"]
+        ):
+            return False
+        closing_distance = me["stats"]["boost_speed"] * gun["stats"]["reload"] + 7
+        for enemy in near[:3]:
+            ex, ey, ez = enemy["pos"]
+            if math.dist((ex, ey), muzzle[:2]) < closing_distance or self.arena.clear(
+                (ex, ey, ez + 7), muzzle
+            ):
+                return False
+        return True
 
     def upgrade_value(self, name):
         value = self.upgrades.get(name, 0)
@@ -246,7 +291,7 @@ class Bot:
                 self.enemy_conflicts.add(index)
         self.free_for_all = len(self.enemy_conflicts) >= 2
 
-    def visible_target(self, enemies, muzzle, hp, yaw, t, charging):
+    def visible_target(self, enemies, muzzle, hp, yaw, t, charging, lightning, energy):
         candidates = []
         for enemy in enemies[:6]:
             x, y, z = enemy["pos"]
@@ -267,6 +312,15 @@ class Bot:
                 score -= 11
             if enemy.get("charging") and distance < 65:
                 score -= 22
+                if (
+                    lightning
+                    and lightning["cooldown"] <= self.dt
+                    and energy >= lightning["stats"]["energy"] + 5
+                    and distance < lightning["stats"]["range"] - 3
+                    and abs(angle_delta(bearing, yaw))
+                    < math.radians(lightning["stats"]["cone_deg"]) * 0.4
+                ):
+                    score -= 32
             candidates.append((score, enemy["id"], enemy))
             if len(candidates) >= 3:
                 break
@@ -298,7 +352,8 @@ class Bot:
                 return (x, y), False
             cover = self.find_cover(obs, near)
             if cover is not None:
-                return cover, False
+                cube = self.cube_near_retreat_path(obs, cover, near)
+                return cube if cube is not None else cover, False
             ax, ay = 0.0, 0.0
             for enemy in near[:5]:
                 px, py = enemy["pos"][:2]
@@ -318,7 +373,7 @@ class Bot:
                     zone["center"][0] + limit * gx,
                     zone["center"][1] + limit * gy,
                 )
-            return escape, False
+            return self.reachable_escape(obs, escape, near), False
 
         if self.free_for_all:
             cubes = self.safe_cubes(obs, near)
@@ -399,6 +454,34 @@ class Bot:
             ), True
         return anchor, True
 
+    def cube_near_retreat_path(self, obs, cover, threats):
+        me = obs["self"]
+        origin = me["pos"]
+        normalized = unit(cover[0] - origin[0], cover[1] - origin[1])
+        remaining = math.dist(origin[:2], cover)
+        if remaining < 4 or any(
+            math.dist(enemy["pos"][:2], origin[:2]) < 35 for enemy in threats
+        ):
+            return None
+
+        stats = me["stats"]
+        candidates = []
+        for cube in obs["cubes"]:
+            x, y, z = cube["pos"]
+            dx, dy = x - origin[0], y - origin[1]
+            along = dx * normalized[0] + dy * normalized[1]
+            across = abs(dx * normalized[1] - dy * normalized[0])
+            if (
+                3.6 < along < min(22, remaining + 1)
+                and across < 3.0
+                and abs(z - origin[2]) < 4.0
+            ):
+                candidates.append((along, cube["id"], (x, y)))
+        for _, _, point in sorted(candidates)[:2]:
+            if self.arena.walk_clear(origin, point, stats["radius"], stats["height"]):
+                return point
+        return None
+
     def remember_pickups(self, obs, held):
         t = obs["t"]
         pos = obs["self"]["pos"]
@@ -458,6 +541,65 @@ class Bot:
             options.append((distance, drop["id"], (px, py)))
         return min(options)[2] if options else None
 
+    def retreat_zone_margin(self, obs, point, eta):
+        t, zone = obs["t"], obs["zone"]
+        begin = max(t, zone["shrink_start"])
+        span = max(0.1, zone["shrink_end"] - begin)
+        fraction = clamp((t + eta - begin) / span, 0.0, 1.0)
+        center = tuple(
+            current + fraction * (future - current)
+            for current, future in zip(zone["center"], zone["next_center"])
+        )
+        radius = zone["radius"] + fraction * (zone["next_radius"] - zone["radius"])
+        return radius - math.dist(point, center)
+
+    def reachable_escape(self, obs, escape, enemies):
+        me = obs["self"]
+        if not me["grounded"]:
+            return escape
+        x, y, z = me["pos"]
+        stats = me["stats"]
+        angle = math.atan2(escape[1] - y, escape[0] - x)
+        center = obs["zone"]["next_center"]
+        inward = math.atan2(center[1] - y, center[0] - x)
+        present_margin = self.retreat_zone_margin(obs, (x, y), 0.0)
+        best = None
+        for distance in (min(26, math.dist((x, y), escape)), 11):
+            if distance < 3:
+                continue
+            for heading in (
+                angle,
+                angle + 0.65,
+                angle - 0.65,
+                angle + 1.3,
+                angle - 1.3,
+                inward,
+            ):
+                point = (
+                    x + distance * math.cos(heading),
+                    y + distance * math.sin(heading),
+                )
+                eta = distance / stats["walk_speed"] + 0.4
+                margin = self.retreat_zone_margin(obs, point, eta)
+                if margin < max(0, min(7, present_margin - 1)):
+                    continue
+                if not self.arena.walk_clear(
+                    (x, y, z), point, stats["radius"], stats["height"]
+                ):
+                    continue
+                score = math.dist((x, y), escape) - math.dist(point, escape)
+                if enemies:
+                    threat = enemies[0]["pos"][:2]
+                    score += 0.7 * (
+                        math.dist(point, threat) - math.dist((x, y), threat)
+                    )
+                score += 0.1 * min(30, margin)
+                if best is None or score > best[0]:
+                    best = score, point
+            if best and best[0] > 0:
+                return best[1]
+        return best[1] if best else escape
+
     def find_cover(self, obs, enemies):
         me, zone, t = obs["self"], obs["zone"], obs["t"]
         x, y, z = me["pos"]
@@ -478,20 +620,22 @@ class Bot:
         visible_now = sum(
             self.arena.clear(enemy, (x, y, z + torso)) for enemy in enemies
         )
-        if visible_now == 0:
+        if visible_now == 0 and self.retreat_zone_margin(obs, (x, y), 1.5) > 0:
             self.cover = (x, y)
             return self.cover
         best = None
         deadline = perf_counter() + 0.006
         away = math.atan2(y - enemies[0][1], x - enemies[0][0])
-        zone_limit = zone["radius"] - max(5.0, zone["dps"] * 0.075)
+        stats = me["stats"]
+        margin = max(3.0, min(10.0, zone["dps"] * 0.075))
         for radius in (12, 25, 39):
             for offset in (0.0, -0.7, 0.7, -1.4, 1.4, -2.1, 2.1):
                 if perf_counter() >= deadline:
                     break
                 px = x + radius * math.cos(away + offset)
                 py = y + radius * math.sin(away + offset)
-                if math.dist((px, py), zone["center"]) >= zone_limit:
+                eta = radius / stats["walk_speed"] + 0.5
+                if self.retreat_zone_margin(obs, (px, py), eta) < margin:
                     continue
                 pz = self.arena.ground(px, py)
                 if not self.arena.can_stand(
@@ -501,7 +645,11 @@ class Bot:
                 exposed = sum(
                     self.arena.clear(enemy, (px, py, pz + torso)) for enemy in enemies
                 )
-                if exposed >= visible_now:
+                if exposed >= max(1, visible_now):
+                    continue
+                if me["grounded"] and not self.arena.walk_clear(
+                    (x, y, z), (px, py), stats["radius"], stats["height"]
+                ):
                     continue
                 progress = math.dist((px, py), zone["next_center"]) - math.dist(
                     (x, y), zone["next_center"]
@@ -672,7 +820,24 @@ class Bot:
                     limits["max_pitch"],
                 ),
             ), [False, False]
-        _, index, yaw, pitch, trigger, _ = max(candidates)
+        selected = max(candidates)
+        _, primary, _, _, trigger, _ = selected
+        selected_weapon = weapons[primary]
+        maintaining_laser = (
+            selected_weapon["kind"] == "laser" and selected_weapon.get("charge", 0) > 0
+        )
+        if not trigger and not maintaining_laser:
+            ready_gun = next(
+                (
+                    shot
+                    for shot in candidates
+                    if shot[4] and weapons[shot[1]]["kind"] == "gun"
+                ),
+                None,
+            )
+            if ready_gun is not None:
+                selected = ready_gun
+        _, index, yaw, pitch, trigger, _ = selected
         fire = [False, False]
         fire[index] = trigger
         for _, other, other_yaw, other_pitch, wants_fire, tol in candidates:
