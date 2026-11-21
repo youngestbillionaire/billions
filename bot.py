@@ -169,7 +169,14 @@ class Bot:
         if retreat and focus and obs["alive"] > 3:
             close = math.dist(focus["pos"][:2], pos[:2]) < 38
             vulnerable = focus.get("hp", 1400) < 160
-            if not close and not vulnerable:
+            under_fire = (
+                not self.free_for_all
+                and t - self.last_damage <= 0.65
+                and focus["id"] == self.attacker_id
+                and math.dist(focus["pos"][:2], pos[:2]) < 125
+                and any(w and w["kind"] == "gun" for w in me["weapons"])
+            )
+            if not (close or vulnerable or under_fire):
                 focus = None
         combat = self.choose_shot(focus, me, muzzle, retreat, obs["alive"], t, urgent)
         firing = combat[1] if combat else [False, False]
