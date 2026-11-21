@@ -109,9 +109,11 @@ class Selector:
         self.files = coverage["files"]
         self.imports = coverage["imports"]
         self.fixtures = coverage.get("fixtures", {})
+        self.source_reads = coverage.get("source_reads", {})
         self.fixture_imports = set(coverage.get("fixture_imports", []))
         self.source = source
         self.comparison_profiles = comparison_profiles or {}
+        self.method_coverage = {}
 
     def select(self, patch):
         try:
@@ -119,6 +121,7 @@ class Selector:
             return set().union(
                 *(
                     self.select_file(change, single_file=len(changes) == 1)
+                    | self.translate(self.source_reads.get(change.path, ()))
                     for change in changes
                 )
             )
@@ -158,8 +161,12 @@ class Selector:
         compile(new, path, "exec", dont_inherit=True)
         if ast.dump(old) == ast.dump(new):
             return set()
-        if self.global_imports(old) != self.global_imports(new):
-            return self.all_tests
+        if self.initialization_effects(old) != self.initialization_effects(new):
+            factories = self.closure_factories(old)
+            if not factories or self.initialization_effects(
+                old, factories
+            ) != self.initialization_effects(new, factories):
+                return self.all_tests
 
         equivalent = set()
         if single_file and path in self.comparison_profiles:
@@ -177,7 +184,10 @@ class Selector:
         boolean_expressions = [
             node for node in ast.walk(old) if isinstance(node, (ast.BoolOp, ast.IfExp))
         ]
-        selected = set()
+        changed_methods = self.class_methods(old) ^ self.class_methods(new)
+        selected = set().union(
+            *(self.method_users(name) for _, name in changed_methods)
+        )
         for offset, removed, added in change.edits:
             lines = range(offset + 1, offset + len(removed) + 1)
             if not removed:
@@ -201,18 +211,159 @@ class Selector:
         return (self.translate(selected) - equivalent) | self.unmapped
 
     @staticmethod
-    def global_imports(tree):
-        """An import-time failure can prevent collection in unrelated test files."""
+    def initialization_effects(tree, factories=frozenset()):
+        """Collect expressions capable of failing before a test reaches the module."""
         pending = [tree]
-        imports = []
+        effects = [
+            ("definition", node.name)
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
         while pending:
             node = pending.pop()
             if isinstance(node, FUNCTION):
+                pending.append(node.args)
+                if not isinstance(node, ast.Lambda):
+                    pending.extend(node.decorator_list)
+                    if node.returns is not None:
+                        pending.append(node.returns)
                 continue
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                imports.append(ast.dump(node))
+            if isinstance(node, ast.ClassDef):
+                effects.append(("class", node.name))
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in factories
+                and all(isinstance(arg, ast.Constant) for arg in node.args)
+                and all(
+                    kw.arg is not None and isinstance(kw.value, ast.Constant)
+                    for kw in node.keywords
+                )
+            ):
+                # This call only binds literal inputs for execution later.
+                effects.append(
+                    (
+                        node.func.id,
+                        len(node.args),
+                        tuple(kw.arg for kw in node.keywords),
+                    )
+                )
+            elif isinstance(
+                node,
+                (
+                    ast.Import,
+                    ast.ImportFrom,
+                    ast.Call,
+                    ast.Attribute,
+                    ast.Subscript,
+                    ast.BinOp,
+                    ast.Assert,
+                    ast.Raise,
+                    ast.Name,
+                ),
+            ):
+                effects.append(ast.dump(node))
             pending.extend(ast.iter_child_nodes(node))
-        return imports
+        return effects
+
+    def closure_factories(self, tree):
+        """Resolve imported callbacks whose factory only creates a closure."""
+        call_names = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and (node.args or node.keywords)
+            and all(isinstance(arg, ast.Constant) for arg in node.args)
+            and all(isinstance(kw.value, ast.Constant) for kw in node.keywords)
+        }
+        factories = set()
+        for statement in tree.body:
+            if not (
+                isinstance(statement, ast.ImportFrom)
+                and statement.level == 0
+                and statement.module
+                and statement.module.startswith("sqlglot.")
+            ):
+                continue
+            names = {
+                alias.name: alias.asname or alias.name
+                for alias in statement.names
+                if (alias.asname or alias.name) in call_names
+            }
+            if not names:
+                continue
+            source = self.source.joinpath(*statement.module.split(".")).with_suffix(
+                ".py"
+            )
+            if not source.is_file():
+                continue
+            module = ast.parse(source.read_bytes())
+            postponed_annotations = any(
+                isinstance(node, ast.ImportFrom)
+                and node.module == "__future__"
+                and any(alias.name == "annotations" for alias in node.names)
+                for node in module.body
+            )
+            if postponed_annotations:
+                factories.update(
+                    names[node.name]
+                    for node in module.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name in names
+                    and self.is_closure_factory(node)
+                )
+        return factories
+
+    @staticmethod
+    def is_closure_factory(node):
+        if node.decorator_list or len(node.body) != 2:
+            return False
+        callback, result = node.body
+        args = node.args
+        return (
+            args.vararg is not None
+            and args.kwarg is not None
+            and not (args.posonlyargs or args.args or args.kwonlyargs)
+            and isinstance(callback, ast.FunctionDef)
+            and not (callback.decorator_list or callback.args.defaults)
+            and all(default is None for default in callback.args.kw_defaults)
+            and isinstance(result, ast.Return)
+            and isinstance(result.value, ast.Name)
+            and result.value.id == callback.name
+        )
+
+    @staticmethod
+    def class_methods(tree):
+        return {
+            (owner.name, method.name)
+            for owner in ast.walk(tree)
+            if isinstance(owner, ast.ClassDef)
+            for method in owner.body
+            if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+    def method_users(self, name):
+        # An added override can intercept a method that ran in a base module.
+        if name not in self.method_coverage:
+            users = set()
+            pattern = re.compile(rf"\bdef\s+{re.escape(name)}\s*\(")
+            for path, coverage in self.files.items():
+                if not path.startswith("sqlglot/") or not path.endswith(".py"):
+                    continue
+                source = (self.source / path).read_text(encoding="utf-8")
+                if not pattern.search(source):
+                    continue
+                for node in ast.walk(ast.parse(source)):
+                    if (
+                        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and node.name == name
+                    ):
+                        users.update(
+                            self.covered_range(coverage, node.lineno, node.end_lineno)
+                        )
+            self.method_coverage[name] = users
+        return self.method_coverage[name]
 
     def scope_users(self, line, coverage, functions):
         scopes = [node for node in functions if node.lineno < line <= node.end_lineno]

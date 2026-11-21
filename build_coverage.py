@@ -43,18 +43,28 @@ class TestContexts:
         self.repo = repo
         self.nodeid = ""
         self.fixtures: dict[str, set[str]] = {}
+        self.source_reads: dict[str, set[str]] = {}
 
     def trace_open(self, event: str, arguments: tuple) -> None:
         if event != "open" or isinstance(arguments[0], int):
             return
         filename = os.fsdecode(arguments[0])
-        if "fixtures" not in filename:
+        is_fixture = "fixtures" in filename
+        if not is_fixture and (not self.nodeid or not filename.endswith(".py")):
             return
         absolute = Path(os.path.abspath(filename))
-        if not absolute.is_relative_to(self.repo / "tests" / "fixtures"):
+        if is_fixture and absolute.is_relative_to(self.repo / "tests" / "fixtures"):
+            path = absolute.relative_to(self.repo).as_posix()
+            self.fixtures.setdefault(path, set()).add(self.nodeid)
             return
-        path = absolute.relative_to(self.repo).as_posix()
-        self.fixtures.setdefault(path, set()).add(self.nodeid)
+        if self.nodeid and absolute.is_relative_to(self.repo / "sqlglot"):
+            caller = sys._getframe(1).f_globals.get("__name__", "")
+            if caller not in {
+                "_frozen_importlib_external",
+                "importlib._bootstrap_external",
+            }:
+                path = absolute.relative_to(self.repo).as_posix()
+                self.source_reads.setdefault(path, set()).add(self.nodeid)
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_runtest_protocol(self, item: pytest.Item):
@@ -69,7 +79,10 @@ class TestContexts:
 
 def extract_map(data: coverage.CoverageData, contexts: TestContexts) -> dict:
     fixture_contexts = {
-        nodeid for nodes in contexts.fixtures.values() for nodeid in nodes
+        nodeid
+        for paths in (contexts.fixtures, contexts.source_reads)
+        for nodes in paths.values()
+        for nodeid in nodes
     }
     nodeids = sorted((data.measured_contexts() | fixture_contexts) - {""})
     node_indexes = {nodeid: index for index, nodeid in enumerate(nodeids)}
@@ -104,6 +117,10 @@ def extract_map(data: coverage.CoverageData, contexts: TestContexts) -> dict:
         "imports": imports,
         "fixtures": fixtures,
         "fixture_imports": fixture_imports,
+        "source_reads": {
+            path: sorted(node_indexes[nodeid] for nodeid in nodes)
+            for path, nodes in sorted(contexts.source_reads.items())
+        },
     }
 
 

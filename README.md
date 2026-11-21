@@ -1,6 +1,8 @@
 # RWX Blast Radius
 
-A coverage-based selector for the Blast Radius track. It maps edits to tests using line coverage and fixture reads measured on the pinned SQLGlot revision, including work executed in pytest's subprocesses. For every selected set it compares schedules with up to eight workers, accounting for the scorer's per-worker charge.
+A coverage-based selector for the Blast Radius track. It maps edits to tests using line coverage, fixture reads, and direct Python source reads measured on the pinned SQLGlot revision, including work executed in pytest's subprocesses.
+
+Method additions and removals include tests that exercised the method through another class. Changes that can break module initialization select the entire suite. For every selected set the selector compares schedules with up to eight workers, accounting for the scorer's per-worker charge.
 
 For a patch that only replaces one identity comparison with its equality counterpart, the optional comparison profile can exclude tests whose baseline operands established equivalent results without custom comparison code. Other tests follow the regular coverage selection.
 
