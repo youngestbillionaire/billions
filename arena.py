@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from heapq import heappop, heappush
 from math import ceil, floor, hypot, sqrt
 from pathlib import Path
-from time import perf_counter
 
 
 def inside(x, y, ring):
@@ -78,6 +77,10 @@ class Arena:
         self.width = ceil((b["maxX"] - b["minX"]) / self.cell)
         self.height = ceil((b["maxY"] - b["minY"]) / self.cell)
         self.walkable = {}
+        # Resolve static building geometry before the first timed observation.
+        for y in range(self.height):
+            for x in range(self.width):
+                self.open_cell((x, y))
 
     def ground(self, x, y):
         t = self.terrain
@@ -156,22 +159,23 @@ class Arena:
         cells.sort(key=lambda c: (c[0] - x) ** 2 + (c[1] - y) ** 2)
         return next((c for c in cells if self.open_cell(c)), None)
 
-    def path(self, start, end, seconds=0.009):
+    def path(self, start, end):
         a, b = self.nearest_open(self.grid(start)), self.nearest_open(self.grid(end))
         if a is None or b is None or a == b:
             return []
-        deadline = perf_counter() + seconds
         distance = lambda c: hypot(c[0] - b[0], c[1] - b[1])
         queue = [(distance(a), 0.0, a)]
         parents, costs = {}, {a: 0.0}
         best = a
-        while queue:
+        for _ in range(750):
+            if not queue:
+                break
             _, cost, cell = heappop(queue)
             if cost != costs[cell]:
                 continue
             if distance(cell) < distance(best):
                 best = cell
-            if cell == b or perf_counter() >= deadline:
+            if cell == b:
                 break
             x, y = cell
             for dx, dy, step in self.neighbors:
