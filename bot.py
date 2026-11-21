@@ -74,6 +74,7 @@ class Bot:
         self.last_trade_time = 0.0
         self.focus_id = None
         self.laser_blocked_until = -1.0
+        self.lightning_needed_until = -1.0
         self.last_laser_aim = None
         self.last_laser_target_time = -1.0
         self.recovering = False
@@ -124,6 +125,7 @@ class Bot:
         )
         self.observe_enemy_combat(obs, enemies)
         near = [m for m in enemies if math.dist(m["pos"][:2], pos[:2]) < 115]
+        self.rate_loadout(obs, near)
         charging = any(
             w and w["kind"] == "laser" and w.get("charge", 0) > 0 for w in me["weapons"]
         )
@@ -358,13 +360,18 @@ class Bot:
             if arming:
                 return tuple(min(arming)[2]["pos"][:2]), False
 
-        if focus and (distance := math.dist(focus["pos"][:2], (x, y))) < 90:
+        if focus and (distance := math.dist(focus["pos"][:2], (x, y))) < 116:
             ex, ey = focus["pos"][:2]
             ux, uy = unit(ex - x, ey - y)
             secondary = {w["kind"] for w in me["weapons"] if w}
             ideal = (
                 34 if "lightning" in secondary else 57 if "laser" in secondary else 54
             )
+            if "laser" in secondary and "gun" in secondary:
+                enemy_weapons = focus.get("weapons", ())
+                ideal = 94 if "lightning" in enemy_weapons else 78
+            if "lightning" in secondary and me["energy"] < 18:
+                ideal = max(58, ideal)
             if hp > 0.73 and len(near) <= 2 and focus.get("hp", 1400) < 250:
                 ideal = min(ideal, 31)
             radial = clamp((distance - ideal) / 27, -0.98, 0.75)
@@ -531,6 +538,24 @@ class Bot:
                 break
         self.cover = best[1] if best else None
         return self.cover
+
+    def rate_loadout(self, obs, near):
+        me = obs["self"]
+        position = me["pos"][:2]
+        t = obs["t"]
+        if any(
+            "laser" in enemy.get("weapons", ())
+            and math.dist(position, enemy["pos"][:2]) < 67
+            for enemy in near
+        ):
+            self.lightning_needed_until = t + 8
+        close_game = self.free_for_all or obs["zone"]["next_radius"] < 53
+        keep_lightning = close_game or t < self.lightning_needed_until
+        self.weapons = (
+            {"mortar": 0, "gun": 1, "lightning": 2, "laser": 3}
+            if keep_lightning
+            else {"mortar": 0, "gun": 2, "lightning": 1.8, "laser": 3}
+        )
 
     def want_weapon(self, kind, held):
         return (
