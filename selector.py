@@ -132,11 +132,13 @@ class Selector:
 
     def select_file(self, change, *, single_file):
         path = change.path
+        if change.structural or not change.edits:
+            return self.all_tests
         if path in self.test_files:
-            return self.test_files[path]
+            return self.test_files[path] | self.translate(self.module_users(path))
         if path in self.fixtures and path not in self.fixture_imports:
             return self.translate(self.fixtures[path])
-        if change.structural or not change.edits or path not in self.files:
+        if path not in self.files:
             return self.all_tests
 
         old_lines = (self.source / path).read_text(encoding="utf-8").split("\n")
@@ -149,16 +151,21 @@ class Selector:
             new_lines.extend(added)
             cursor = start + len(removed)
         new_lines.extend(old_lines[cursor:])
-        old = ast.parse("\n".join(old_lines), type_comments=True)
-        new = ast.parse("\n".join(new_lines), type_comments=True)
+        old = ast.parse("\n".join(old_lines).encode(), type_comments=True)
+        new_source = "\n".join(new_lines).encode()
+        new = ast.parse(new_source, type_comments=True)
+        # Parsing alone accepts statements that Python can reject on import.
+        compile(new, path, "exec", dont_inherit=True)
         if ast.dump(old) == ast.dump(new):
             return set()
+        if self.global_imports(old) != self.global_imports(new):
+            return self.all_tests
 
         equivalent = set()
         if single_file and path in self.comparison_profiles:
             equivalent = self.equivalent_tests(old, new, self.comparison_profiles[path])
 
-        if name := self.changed_scalar_attribute(change, old, new):
+        if single_file and (name := self.changed_scalar_attribute(change, old, new)):
             readers = self.attribute_readers(name)
             if readers:
                 return self.translate(readers) | self.unmapped
@@ -171,7 +178,7 @@ class Selector:
             node for node in ast.walk(old) if isinstance(node, (ast.BoolOp, ast.IfExp))
         ]
         selected = set()
-        for offset, removed, _ in change.edits:
+        for offset, removed, added in change.edits:
             lines = range(offset + 1, offset + len(removed) + 1)
             if not removed:
                 lines = (offset, offset + 1)
@@ -181,6 +188,8 @@ class Selector:
                         path, line, coverage, import_lines, functions, statements
                     )
                 )
+                if len(removed) != len(added) or not single_file:
+                    selected.update(self.scope_users(line, coverage, functions))
                 for expression in boolean_expressions:
                     if expression.lineno < line <= expression.end_lineno:
                         # An edited operand may execute on a previously short-circuited path.
@@ -190,6 +199,27 @@ class Selector:
                             )
                         )
         return (self.translate(selected) - equivalent) | self.unmapped
+
+    @staticmethod
+    def global_imports(tree):
+        """An import-time failure can prevent collection in unrelated test files."""
+        pending = [tree]
+        imports = []
+        while pending:
+            node = pending.pop()
+            if isinstance(node, FUNCTION):
+                continue
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                imports.append(ast.dump(node))
+            pending.extend(ast.iter_child_nodes(node))
+        return imports
+
+    def scope_users(self, line, coverage, functions):
+        scopes = [node for node in functions if node.lineno < line <= node.end_lineno]
+        if not scopes:
+            return set()
+        scope = min(scopes, key=lambda node: node.end_lineno - node.lineno)
+        return self.covered_range(coverage, scope.lineno + 1, scope.end_lineno)
 
     def equivalent_tests(self, old, new, profiles):
         # Only use observations if the entire AST differs by one comparison operator.
@@ -238,7 +268,9 @@ class Selector:
             statement_hits = coverage.get(str(statement.lineno), [])
             if statement_hits and statement.lineno != scope.lineno:
                 return statement_hits
-            return self.covered_range(coverage, scope.lineno + 1, scope.end_lineno)
+            return self.scope_users(line, coverage, functions) or self.module_users(
+                path
+            )
 
         return self.module_users(path)
 
