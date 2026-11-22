@@ -68,8 +68,22 @@ class Bot:
         self.route_goal = None
         self.replan = -1.0
         self.last_damage = -100.0
+        self.last_combat = -100.0
         self.damage_bearing = None
         self.attacker_id = None
+        self.hits_from = {}
+        self.contacts = {}
+        self.short_target = None
+        self.short_until = -1.0
+        self.recovery_exit = None
+        self.peek = None
+        self.peek_after = -1.0
+        self.finish_shot_after = -1.0
+        self.finish_shot_target = None
+        self.pursuit_until = -1.0
+        self.pursuit_used = None
+        self.pursuit_anchor = None
+        self.previous_focus = None
         self.focus_id = None
         self.laser_blocked_until = -1.0
         self.last_laser_aim = None
@@ -101,9 +115,24 @@ class Bot:
                 y - zone["next_center"][1], x - zone["next_center"][0]
             )
         for event in obs["events"]:
+            if event["type"] == "kill":
+                self.contacts.pop(event.get("target"), None)
+                if self.previous_focus and self.previous_focus[1]["id"] == event.get(
+                    "target"
+                ):
+                    self.previous_focus = None
+            if event["type"] in {"damaged", "hit"}:
+                self.last_combat = t
             if event["type"] == "damaged" and event.get("bearing") is not None:
                 self.last_damage, self.damage_bearing = t, event["bearing"]
                 self.attacker_id = event.get("by")
+                if self.attacker_id is not None and 0 <= self.attacker_id < 16:
+                    self.hits_from[self.attacker_id] = t
+            if event["type"] == "hit" and event.get("effect") == "short":
+                self.short_target = event.get("target")
+                self.short_until = t + min(
+                    1.1, self.config["weapons"]["lightning"]["short_s"]
+                )
             if event["type"] == "effect" and event.get("effect") == "short":
                 self.laser_blocked_until = (
                     t + self.config["weapons"]["lightning"]["short_s"]
@@ -115,6 +144,11 @@ class Bot:
         )
         self.observe_enemy_combat(obs, enemies)
         near = [m for m in enemies if math.dist(m["pos"][:2], pos[:2]) < 115]
+        self.contacts = {
+            key: entry for key, entry in self.contacts.items() if t - entry[0] <= 1.4
+        }
+        self.contacts.update((enemy["id"], (t, enemy)) for enemy in near)
+        threats = self.recent_threats(near, t)
         charging = any(
             w and w["kind"] == "laser" and w.get("charge", 0) > 0 for w in me["weapons"]
         )
@@ -128,7 +162,31 @@ class Bot:
             next((w for w in me["weapons"] if w and w["kind"] == "lightning"), None),
             me["energy"],
         )
-        self.focus_id = focus["id"] if focus else None
+        new_attacker = (
+            self.attacker_id != self.focus_id
+            and sum(t - damage_at <= 0.85 for damage_at in self.hits_from.values()) >= 2
+        )
+        if new_attacker and t - self.last_damage <= 0.35 and not charging:
+            attacker = next(
+                (enemy for enemy in near if enemy["id"] == self.attacker_id), None
+            )
+            if (
+                attacker
+                and self.target_clear(muzzle, attacker)
+                and (focus is None or focus.get("hp", 1400) > 70)
+            ):
+                focus = attacker
+                self.cover_refresh = -1.0
+        elif hp >= 0.72 and not charging and t < self.short_until:
+            target = next(
+                (enemy for enemy in near if enemy["id"] == self.short_target), None
+            )
+            if (
+                target
+                and math.dist(target["pos"][:2], pos[:2]) < 68
+                and self.target_clear(muzzle, target)
+            ):
+                focus = target
         danger = t - self.last_damage < 2.2 or bool(near)
         crossfire = (
             self.free_for_all
@@ -162,7 +220,48 @@ class Bot:
                 and t - self.last_damage > 1.3
             ):
                 focus = None
-        goal, can_farm = self.destination(obs, hp, near, focus, urgent, retreat)
+        self.focus_id = focus["id"] if focus else None
+        goal, can_farm = self.destination(
+            obs, hp, near, focus, urgent, retreat, threats
+        )
+        if (
+            urgent
+            or hp < 0.69
+            or new_attacker
+            or (not retreat and self.peek and not self.peek[4])
+        ):
+            self.peek = None
+        goal, peek_target = self.recovery_peek(
+            obs,
+            goal,
+            hp,
+            threats,
+            focus,
+            (retreat or self.peek is not None)
+            and not urgent
+            and not new_attacker
+            and not charging,
+        )
+        if not retreat and not urgent and not focus and self.peek is None:
+            chase_goal = self.corner_pursuit(obs, hp, threats)
+            if chase_goal is not None:
+                goal, can_farm = chase_goal, False
+        if focus:
+            self.previous_focus = (t, focus)
+            self.pursuit_until = -1.0
+            self.pursuit_used = None
+            self.pursuit_anchor = None
+        if (
+            retreat
+            and focus
+            and focus["id"] == self.short_target
+            and t < self.short_until
+            and hp < 0.62
+            and math.dist(pos[:2], goal) < 2
+            and self.recovery_exit
+            and self.retreat_zone_margin(obs, self.recovery_exit, 1.5) > 5
+        ):
+            goal = self.recovery_exit
         act = {"tick": obs["tick"]}
         if obs.get("offer"):
             act["pick"] = max(
@@ -173,6 +272,7 @@ class Bot:
 
         if not focus and can_farm:
             focus = self.farm_target(obs, muzzle)
+        last_shot = None
         if retreat and focus and obs["alive"] > 3:
             close = math.dist(focus["pos"][:2], pos[:2]) < 38
             vulnerable = focus.get("hp", 1400) < 160
@@ -183,13 +283,38 @@ class Bot:
                 and math.dist(focus["pos"][:2], pos[:2]) < 125
                 and any(w and w["kind"] == "gun" for w in me["weapons"])
             )
-            if not (close or vulnerable or under_fire):
+            if vulnerable and not (close or under_fire) and self.peek is None:
+                last_shot = self.finishing_gun(obs, focus, muzzle, goal)
+            safe_finish = vulnerable and (
+                t >= self.finish_shot_after or focus["id"] != self.finish_shot_target
+            )
+            if not (close or under_fire or safe_finish) or (
+                self.peek is not None and not peek_target
+            ):
                 focus = None
-        combat = self.choose_shot(focus, me, muzzle, retreat, obs["alive"], t, urgent)
+        if self.peek is not None:
+            combat = (
+                self.aligned_gun(me, peek_target, muzzle)
+                if peek_target and not charging
+                else None
+            )
+        else:
+            combat = self.choose_shot(
+                focus, me, muzzle, retreat, obs["alive"], t, urgent
+            )
+        if last_shot is not None and not charging:
+            combat = last_shot
+            self.finish_shot_after = t + 1.15
+            self.finish_shot_target = self.focus_id
+        if peek_target and combat and any(combat[1]):
+            anchor, point, target_id, _, _ = self.peek
+            self.peek = anchor, point, target_id, t + 1.3, True
+            self.peek_after = t + 4.0
+            goal = anchor
         firing = combat[1] if combat else [False, False]
         aim = combat[0] if combat else self.look(obs, goal, near)
         if (
-            not self.free_for_all
+            (not self.free_for_all or new_attacker)
             and not any(firing)
             and not charging
             and t - self.last_damage < 0.45
@@ -217,14 +342,20 @@ class Bot:
         )
         if not me["grounded"] and not stuck_jump:
             boosting = False
+        if self.peek is not None and not self.peek[4]:
+            boosting = False
         act.update(
             move=list(step), aim=list(aim), fire=firing, boost=boosting, jump=stuck_jump
         )
-        if not focus and self.safe_reload(obs, near, muzzle, act, danger):
+        if (
+            not focus
+            and self.peek is None
+            and self.safe_reload(obs, near, muzzle, act, danger, goal)
+        ):
             act["reload"] = True
         return act
 
-    def safe_reload(self, obs, near, muzzle, act, danger):
+    def safe_reload(self, obs, near, muzzle, act, danger, goal=None):
         me = obs["self"]
         for slot, gun in enumerate(me["weapons"]):
             if not gun or gun["kind"] != "gun":
@@ -234,7 +365,7 @@ class Bot:
             ammo = gun["ammo"]
             if 0 < ammo < 4 and not danger:
                 return True
-            if not 0 < ammo <= gun["stats"]["mag"] // 2:
+            if not 0 < ammo <= gun["stats"]["mag"] * 2 // 3:
                 return False
             break
         else:
@@ -248,6 +379,12 @@ class Bot:
         ):
             return False
         closing_distance = me["stats"]["boost_speed"] * gun["stats"]["reload"] + 7
+        if goal is not None and self.reload_on_rotation(
+            obs, goal, self.recent_threats(near, obs["t"]), muzzle, gun
+        ):
+            return True
+        if ammo > gun["stats"]["mag"] // 2:
+            return False
         for enemy in near[:3]:
             ex, ey, ez = enemy["pos"]
             if math.dist((ex, ey), muzzle[:2]) < closing_distance or self.arena.clear(
@@ -255,6 +392,212 @@ class Bot:
             ):
                 return False
         return True
+
+    def target_clear(self, muzzle, target):
+        x, y, z = target["pos"]
+        return self.arena.clear(
+            muzzle, (x, y, z + 4.5 * (1 + 0.05 * target.get("cubes", 0)))
+        )
+
+    def recent_threats(self, visible, now):
+        threats = list(visible)
+        seen = {enemy["id"] for enemy in visible}
+        hidden = sorted(self.contacts.values(), key=lambda contact: -contact[0])
+        for seen_at, enemy in hidden:
+            if enemy["id"] in seen or now - seen_at > 1.4 or len(threats) >= 4:
+                continue
+            age = min(0.65, now - seen_at)
+            pos = enemy["pos"]
+            vel = enemy["vel"]
+            forecast = (pos[0] + age * vel[0], pos[1] + age * vel[1], pos[2])
+            if not self.arena.clear(
+                (*pos[:2], pos[2] + 7), (*forecast[:2], forecast[2] + 7)
+            ):
+                forecast = pos
+            threats.append({**enemy, "pos": forecast})
+        return threats
+
+    def reload_on_rotation(self, obs, goal, visible, muzzle, gun):
+        me = obs["self"]
+        t = obs["t"]
+        if not me["grounded"] or t - self.last_combat < 2.2 or not visible:
+            return False
+        distance = math.dist(me["pos"][:2], goal)
+        segment = me["stats"]["boost_speed"] * (gun["stats"]["reload"] + 0.15)
+        if distance < segment:
+            return False
+        ux, uy = unit(goal[0] - muzzle[0], goal[1] - muzzle[1])
+        end = (muzzle[0] + segment * ux, muzzle[1] + segment * uy)
+        if not self.arena.walk_clear(
+            me["pos"], end, me["stats"]["radius"], me["stats"]["height"]
+        ):
+            return False
+        for enemy in visible[:4]:
+            ex, ey, ez = enemy["pos"]
+            eye = ex, ey, ez + 7
+            if math.dist(eye[:2], muzzle[:2]) < segment + 12:
+                return False
+            for fraction in (0, 0.33, 0.67, 1):
+                x, y = (
+                    muzzle[0] + segment * ux * fraction,
+                    muzzle[1] + segment * uy * fraction,
+                )
+                if self.arena.clear(
+                    eye, (x, y, self.arena.ground(x, y) + me["stats"]["muzzle_height"])
+                ):
+                    return False
+        return True
+
+    def recovery_peek(self, obs, goal, hp, threats, focus, allowed):
+        me, t = obs["self"], obs["t"]
+        pos = me["pos"]
+        if not allowed or hp < 0.69:
+            return goal, None
+        if self.peek:
+            anchor, point, target_id, expires, returning = self.peek
+            if returning:
+                if t >= expires or math.dist(pos[:2], anchor) < 1.1:
+                    self.peek = None
+                    return goal, None
+                return anchor, None
+            if t >= expires or t - self.last_damage < 0.45:
+                self.peek = anchor, point, target_id, t + 1.3, True
+                self.peek_after = t + 4.0
+                return anchor, None
+            if focus and focus["id"] == target_id:
+                return point, focus
+            return point, None
+
+        if (
+            not me["grounded"]
+            or not 0.80 <= hp < 0.90
+            or t < self.peek_after
+            or t - self.last_combat <= me["stats"]["regen_delay"]
+            or math.dist(pos[:2], goal) > 1.5
+            or not self.recovery_exit
+            or len(threats) != 1
+            or self.retreat_zone_margin(obs, pos[:2], 3) < 8
+            or not any(
+                w
+                and w["kind"] == "gun"
+                and w["ammo"]
+                and not w["reload"]
+                and w["cooldown"] < 0.15
+                for w in me["weapons"]
+            )
+        ):
+            return goal, None
+        target = threats[0]
+        if not 24 < math.dist(pos[:2], target["pos"][:2]) < 80:
+            return goal, None
+        stats = me["stats"]
+        current = (*pos[:2], pos[2] + stats["muzzle_height"])
+        if self.target_clear(current, target):
+            return goal, None
+        bearing = math.atan2(target["pos"][1] - pos[1], target["pos"][0] - pos[0])
+        for offset in (1.05, -1.05, 1.65, -1.65):
+            x, y = (
+                pos[0] + 5 * math.cos(bearing + offset),
+                pos[1] + 5 * math.sin(bearing + offset),
+            )
+            if self.arena.walk_clear(
+                pos, (x, y), stats["radius"], stats["height"]
+            ) and self.target_clear(
+                (x, y, self.arena.ground(x, y) + stats["muzzle_height"]), target
+            ):
+                self.peek = tuple(pos[:2]), (x, y), target["id"], t + 0.85, False
+                return (x, y), None
+        return goal, None
+
+    def finishing_gun(self, obs, target, muzzle, cover):
+        me, t = obs["self"], obs["t"]
+        if (
+            t < self.finish_shot_after
+            or math.dist(me["pos"][:2], cover) <= 2
+            or math.dist(me["pos"][:2], target["pos"][:2]) > 85
+        ):
+            return None
+        return self.aligned_gun(me, target, muzzle, lethal=True)
+
+    def aligned_gun(self, me, target, muzzle, lethal=False):
+        cubes = self.config["cubes"]
+        multiplier = 1 + cubes["damage_per_cube"] * min(me["cubes"], cubes["stat_cap"])
+        for slot, gun in enumerate(me["weapons"]):
+            if (
+                not gun
+                or gun["kind"] != "gun"
+                or not gun["ammo"]
+                or gun["reload"]
+                or gun["cooldown"] > 0.04
+            ):
+                continue
+            if (
+                lethal
+                and target.get("hp", math.inf)
+                > gun["stats"]["damage"] * multiplier * 0.72
+            ):
+                continue
+            center = 4.5 * (1 + 0.05 * target.get("cubes", 0))
+            x, y, z = target["pos"]
+            solution = self.aim_at(
+                "gun", gun["stats"], (x, y, z + center), target["vel"], muzzle, center
+            )
+            if solution:
+                yaw, pitch, _, tolerance = solution
+                if (
+                    abs(angle_delta(yaw, me["aim"][0])) <= tolerance
+                    and abs(pitch - me["aim"][1]) <= tolerance
+                ):
+                    firing = [False, False]
+                    firing[slot] = True
+                    return (yaw, pitch), firing
+        return None
+
+    def corner_pursuit(self, obs, hp, threats):
+        if self.previous_focus is None or hp < 0.84 or not obs["self"]["grounded"]:
+            return None
+        seen_at, target = self.previous_focus
+        t, me = obs["t"], obs["self"]
+        if (
+            t - self.last_damage < 1.2
+            or target.get("hp", 1400) > 115
+            or any(enemy["id"] != target["id"] for enemy in threats)
+            or any(drop["holder"] == me["id"] for drop in obs["drops"])
+            or not any(
+                w and w["kind"] == "gun" and w["ammo"] > 0 and not w["reload"]
+                for w in me["weapons"]
+            )
+        ):
+            return None
+        if self.pursuit_used != seen_at and t - seen_at <= 0.2:
+            self.pursuit_until = t + 0.65
+            self.pursuit_used = seen_at
+            self.pursuit_anchor = tuple(me["pos"][:2])
+        if t >= self.pursuit_until:
+            return None
+        origin = me["pos"]
+        if not 18 < math.dist(origin[:2], target["pos"][:2]) < 57:
+            return None
+        bearing = math.atan2(target["pos"][1] - origin[1], target["pos"][0] - origin[0])
+        stats = me["stats"]
+        for offset in (0.75, -0.75, 1.3, -1.3):
+            x, y = (
+                origin[0] + 7 * math.cos(bearing + offset),
+                origin[1] + 7 * math.sin(bearing + offset),
+            )
+            z = self.arena.ground(x, y)
+            if (
+                self.retreat_zone_margin(obs, (x, y), 3.0) > 12
+                and self.arena.walk_clear(
+                    origin, (x, y), stats["radius"], stats["height"]
+                )
+                and self.arena.walk_clear(
+                    (x, y, z), self.pursuit_anchor, stats["radius"], stats["height"]
+                )
+                and self.target_clear((x, y, z + stats["muzzle_height"]), target)
+            ):
+                return x, y
+        return None
 
     def upgrade_value(self, name):
         value = self.upgrades.get(name, 0)
@@ -326,7 +669,7 @@ class Bot:
                 break
         return min(candidates)[2] if candidates else None
 
-    def destination(self, obs, hp, near, focus, urgent, retreat):
+    def destination(self, obs, hp, near, focus, urgent, retreat, threats):
         me, zone = obs["self"], obs["zone"]
         x, y, z = me["pos"]
         center = zone["next_center"]
@@ -350,7 +693,10 @@ class Bot:
         if retreat:
             if self.last_damage + 2.2 < t and not near:
                 return (x, y), False
-            cover = self.find_cover(obs, near)
+            backup = self.use_recovery_exit(obs, threats)
+            if backup is not None:
+                return backup, False
+            cover = self.find_cover(obs, threats)
             if cover is not None:
                 cube = self.cube_near_retreat_path(obs, cover, near)
                 return cube if cube is not None else cover, False
@@ -538,8 +884,52 @@ class Bot:
                 continue
             if drop["holder"] == me["id"] and distance + 2 < drop["radius"]:
                 return x, y
-            options.append((distance, drop["id"], (px, py)))
+            destination = (px, py)
+            if (
+                drop["holder"] is None
+                and drop["lands_in"] <= 0.4
+                and threats
+                and me["grounded"]
+            ):
+                destination = (
+                    self.supply_ring_position(obs, drop, threats) or destination
+                )
+            options.append((distance, drop["id"], destination))
         return min(options)[2] if options else None
+
+    def supply_ring_position(self, obs, drop, threats):
+        me, stats = obs["self"], obs["self"]["stats"]
+        origin = me["pos"]
+        px, py, pz = drop["pos"]
+        distance = max(0, drop["radius"] - 2.8)
+        if distance < 1 or math.dist(origin[:2], (px, py)) > 34:
+            return None
+        eyes = [(*e["pos"][:2], e["pos"][2] + 7) for e in threats[:2]]
+        center = (px, py, pz + stats["height"] * 0.58)
+        exposed = sum(self.arena.clear(eye, center) for eye in eyes)
+        if not exposed:
+            return None
+        bearing = math.atan2(origin[1] - py, origin[0] - px)
+        for offset in (0, 0.85, -0.85, 1.65, -1.65):
+            x, y = (
+                px + distance * math.cos(bearing + offset),
+                py + distance * math.sin(bearing + offset),
+            )
+            z = self.arena.ground(x, y)
+            if (
+                self.retreat_zone_margin(obs, (x, y), 5) > 5
+                and sum(
+                    self.arena.clear(eye, (x, y, z + stats["height"] * 0.58))
+                    for eye in eyes
+                )
+                < exposed
+                and self.arena.walk_clear(
+                    origin, (x, y), stats["radius"], stats["height"]
+                )
+                and self.cover_exit(obs, (x, y, z), eyes, 5) is not None
+            ):
+                return x, y
+        return None
 
     def retreat_zone_margin(self, obs, point, eta):
         t, zone = obs["t"], obs["zone"]
@@ -606,6 +996,7 @@ class Bot:
         if t < self.cover_refresh:
             return self.cover
         self.cover_refresh = t + 0.55
+        self.recovery_exit = None
         enemies = [
             (e["pos"][0], e["pos"][1], e["pos"][2] + 7 * (1 + 0.05 * e.get("cubes", 0)))
             for e in enemies[:3]
@@ -620,8 +1011,16 @@ class Bot:
         visible_now = sum(
             self.arena.clear(enemy, (x, y, z + torso)) for enemy in enemies
         )
-        if visible_now == 0 and self.retreat_zone_margin(obs, (x, y), 1.5) > 0:
+        heal_wait = max(0, me["stats"]["regen_delay"] - (t - self.last_combat))
+        recovery_horizon = min(6, heal_wait + 1.6)
+        if (
+            visible_now == 0
+            and self.retreat_zone_margin(obs, (x, y), recovery_horizon) > 0
+        ):
             self.cover = (x, y)
+            self.recovery_exit = self.cover_exit(
+                obs, (x, y, z), enemies, recovery_horizon
+            )
             return self.cover
         best = None
         deadline = perf_counter() + 0.006
@@ -655,12 +1054,81 @@ class Bot:
                     (x, y), zone["next_center"]
                 )
                 score = 24 * exposed + 0.45 * radius + 0.16 * max(0, progress)
+                if (
+                    self.retreat_zone_margin(obs, (px, py), max(eta, recovery_horizon))
+                    < margin
+                ):
+                    score += 12
                 if best is None or score < best[0]:
-                    best = (score, (px, py))
+                    backup = self.cover_exit(
+                        obs, (px, py, pz), enemies, max(eta, recovery_horizon)
+                    )
+                    score += 1 if backup is None else 0
+                    if best is None or score < best[0]:
+                        best = (score, (px, py), backup)
             if best and best[0] < 14:
                 break
         self.cover = best[1] if best else None
+        self.recovery_exit = best[2] if best else None
         return self.cover
+
+    def cover_exit(self, obs, point, eyes, eta):
+        stats = obs["self"]["stats"]
+        cx, cy = obs["zone"]["next_center"]
+        direction = math.atan2(cy - point[1], cx - point[0])
+        from_me = unit(
+            point[0] - obs["self"]["pos"][0], point[1] - obs["self"]["pos"][1]
+        )
+        for offset in (0, 0.8, -0.8):
+            ux, uy = math.cos(direction + offset), math.sin(direction + offset)
+            if ux * from_me[0] + uy * from_me[1] < -0.65:
+                continue
+            x, y = point[0] + 8 * ux, point[1] + 8 * uy
+            if self.retreat_zone_margin(obs, (x, y), eta + 1) < 4:
+                continue
+            if self.arena.walk_clear(point, (x, y), stats["radius"], stats["height"]):
+                z = self.arena.ground(x, y)
+                if all(
+                    not self.arena.clear(eye, (x, y, z + stats["height"] * 0.58))
+                    for eye in eyes
+                ):
+                    return x, y
+        return None
+
+    def use_recovery_exit(self, obs, threats):
+        me, t = obs["self"], obs["t"]
+        if (
+            not self.cover
+            or not self.recovery_exit
+            or not threats
+            or t - self.last_damage > 0.35
+        ):
+            return None
+        pos, stats = me["pos"], me["stats"]
+        backup = self.recovery_exit
+        if (
+            math.dist(pos[:2], self.cover) > 3
+            or self.retreat_zone_margin(obs, backup, 2.4) < 5
+        ):
+            return None
+        eyes = [(*e["pos"][:2], e["pos"][2] + 7) for e in threats[:3]]
+        height = stats["height"] * 0.58
+        now_exposed = any(
+            self.arena.clear(eye, (*pos[:2], pos[2] + height)) for eye in eyes
+        )
+        later_exposed = any(
+            self.arena.clear(eye, (*backup, self.arena.ground(*backup) + height))
+            for eye in eyes
+        )
+        if (
+            now_exposed
+            and not later_exposed
+            and self.arena.walk_clear(pos, backup, stats["radius"], stats["height"])
+        ):
+            self.cover, self.recovery_exit = backup, None
+            self.cover_refresh = t + 0.55
+            return backup
+        return None
 
     def want_weapon(self, kind, held):
         return (
@@ -788,6 +1256,13 @@ class Bot:
             score = {"gun": 1.8, "lightning": 2.75, "laser": 2.65, "mortar": 2.2}[
                 kind_w
             ]
+            if (
+                kind_w == "gun"
+                and fire
+                and target["id"] == self.short_target
+                and t < self.short_until
+            ):
+                score += 1.25
             if kind_w == "laser":
                 self.last_laser_aim = (yaw, pitch)
                 self.last_laser_target_time = t
