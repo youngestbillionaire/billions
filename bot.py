@@ -1,6 +1,7 @@
 """Original Mech Royale policy using only the kit's map and observations."""
 
 import math
+from itertools import pairwise
 from time import perf_counter
 from typing import ClassVar
 
@@ -66,6 +67,7 @@ class Bot:
         self.anchor = None
         self.route = []
         self.route_goal = None
+        self.zone_route = None
         self.replan = -1.0
         self.last_damage = -100.0
         self.last_combat = -100.0
@@ -161,6 +163,7 @@ class Bot:
             charging,
             next((w for w in me["weapons"] if w and w["kind"] == "lightning"), None),
             me["energy"],
+            me,
         )
         new_attacker = (
             self.attacker_id != self.focus_id
@@ -202,9 +205,7 @@ class Bot:
         next_range = math.dist(pos[:2], next_center)
         safe_radius = max(0.0, zone["next_radius"] - 16)
         travel = max(0.0, next_range - safe_radius) / max(1, stats["walk_speed"])
-        urgent = not me["in_zone"] or (
-            next_range > safe_radius and travel + 9 >= zone["shrink_end"] - t
-        )
+        urgent = self.rotation_due(obs, safe_radius, next_range, travel)
         retreat = (self.recovering or crossfire) and not urgent and obs["alive"] > 2
         if self.free_for_all and focus and obs["alive"] > 3:
             distance = math.dist(focus["pos"][:2], pos[:2])
@@ -221,47 +222,14 @@ class Bot:
             ):
                 focus = None
         self.focus_id = focus["id"] if focus else None
-        goal, can_farm = self.destination(
-            obs, hp, near, focus, urgent, retreat, threats
+        goal, can_farm, peek_target = self.movement_goal(
+            obs, hp, near, focus, urgent, retreat, threats, new_attacker, charging
         )
-        if (
-            urgent
-            or hp < 0.69
-            or new_attacker
-            or (not retreat and self.peek and not self.peek[4])
-        ):
-            self.peek = None
-        goal, peek_target = self.recovery_peek(
-            obs,
-            goal,
-            hp,
-            threats,
-            focus,
-            (retreat or self.peek is not None)
-            and not urgent
-            and not new_attacker
-            and not charging,
-        )
-        if not retreat and not urgent and not focus and self.peek is None:
-            chase_goal = self.corner_pursuit(obs, hp, threats)
-            if chase_goal is not None:
-                goal, can_farm = chase_goal, False
         if focus:
             self.previous_focus = (t, focus)
             self.pursuit_until = -1.0
             self.pursuit_used = None
             self.pursuit_anchor = None
-        if (
-            retreat
-            and focus
-            and focus["id"] == self.short_target
-            and t < self.short_until
-            and hp < 0.62
-            and math.dist(pos[:2], goal) < 2
-            and self.recovery_exit
-            and self.retreat_zone_margin(obs, self.recovery_exit, 1.5) > 5
-        ):
-            goal = self.recovery_exit
         act = {"tick": obs["tick"]}
         if obs.get("offer"):
             act["pick"] = max(
@@ -299,13 +267,36 @@ class Bot:
                 else None
             )
         else:
+            route_eta = travel
+            if self.zone_route and t - self.zone_route[0] < 0.7:
+                route_eta += min(7, self.zone_route[3] / max(1, stats["walk_speed"]))
             combat = self.choose_shot(
-                focus, me, muzzle, retreat, obs["alive"], t, urgent
+                focus,
+                me,
+                muzzle,
+                retreat,
+                obs["alive"],
+                t,
+                urgent,
+                safe_to_charge=me["in_zone"]
+                and hp >= 0.62
+                and route_eta + 6 < zone["shrink_end"] - t,
             )
         if last_shot is not None and not charging:
             combat = last_shot
             self.finish_shot_after = t + 1.15
             self.finish_shot_target = self.focus_id
+        if combat and "take" in act:
+            swapped = act.get("drop")
+            if swapped is not None and (
+                combat[1][swapped]
+                or (
+                    me["weapons"][swapped]
+                    and me["weapons"][swapped].get("charge", 0) > 0
+                )
+            ):
+                act.pop("take")
+                act.pop("drop")
         if peek_target and combat and any(combat[1]):
             anchor, point, target_id, _, _ = self.peek
             self.peek = anchor, point, target_id, t + 1.3, True
@@ -354,6 +345,117 @@ class Bot:
         ):
             act["reload"] = True
         return act
+
+    def movement_goal(
+        self, obs, hp, near, focus, urgent, retreat, threats, new_attacker, charging
+    ):
+        me, t = obs["self"], obs["t"]
+        capture = None if urgent else self.active_capture(obs, hp)
+        if capture:
+            cx, cy = capture["pos"][:2]
+            x, y = me["pos"][:2]
+            vx, vy = me["vel"][:2]
+            drift = (x + 0.28 * vx, y + 0.28 * vy)
+            if math.dist(drift, (cx, cy)) >= capture["radius"] - 1.25:
+                ux, uy = unit(cx - x, cy - y)
+                goal = x + 2 * ux, y + 2 * uy
+            else:
+                goal = x, y
+            can_farm = False
+        else:
+            goal, can_farm = self.destination(
+                obs, hp, near, focus, urgent, retreat, threats
+            )
+        # Hard commitments take precedence over optional combat movement.
+        if urgent or capture or hp < 0.69 or new_attacker or charging:
+            self.peek = None
+        if urgent or capture:
+            self.previous_focus = None
+            self.pursuit_until = -1.0
+            return goal, False, None
+        if not retreat and self.peek and not self.peek[4]:
+            self.peek = None
+        if retreat or self.peek is not None:
+            goal, peek_target = self.recovery_peek(
+                obs, goal, hp, threats, focus, not new_attacker and not charging
+            )
+            if self.peek is not None:
+                return goal, False, peek_target
+        if (
+            retreat
+            and focus
+            and focus["id"] == self.short_target
+            and t < self.short_until
+            and hp < 0.62
+            and math.dist(me["pos"][:2], goal) < 2
+            and self.recovery_exit
+            and self.retreat_zone_margin(obs, self.recovery_exit, 1.5) > 5
+        ):
+            return self.recovery_exit, False, None
+        if not retreat and not focus:
+            pursuit = self.corner_pursuit(obs, hp, threats)
+            if pursuit is not None:
+                return pursuit, False, None
+        return goal, can_farm, None
+
+    def active_capture(self, obs, hp):
+        me = obs["self"]
+        if self.capture_in_danger(hp, obs["t"]):
+            return None
+        return next(
+            (
+                drop
+                for drop in obs["drops"]
+                if drop.get("holder") == me["id"]
+                and math.dist(me["pos"][:2], drop["pos"][:2]) < drop["radius"] - 0.5
+            ),
+            None,
+        )
+
+    def capture_in_danger(self, hp, t):
+        return t - self.last_damage < 0.65 and (
+            hp < 0.34
+            or (
+                hp < 0.46
+                and sum(t - hit < 0.85 for hit in self.hits_from.values()) >= 2
+            )
+        )
+
+    def rotation_due(self, obs, safe_radius, distance, walk_eta):
+        me, zone, t = obs["self"], obs["zone"], obs["t"]
+        if not me["in_zone"]:
+            return True
+        remaining = zone["shrink_end"] - t
+        if distance <= safe_radius:
+            return False
+        if walk_eta + 9 >= remaining:
+            return True
+        if walk_eta + 22 < remaining or not me["grounded"]:
+            return False
+        pos, stats = me["pos"], me["stats"]
+        center = zone["next_center"]
+        ux, uy = unit(center[0] - pos[0], center[1] - pos[1])
+        length = distance - safe_radius
+        target = pos[0] + ux * length, pos[1] + uy * length
+        cached = self.zone_route
+        if (
+            not cached
+            or t - cached[0] >= 0.7
+            or math.dist(pos[:2], cached[1]) > 9
+            or math.dist(target, cached[2]) > 14
+        ):
+            probe = pos[0] + ux * min(length, 32), pos[1] + uy * min(length, 32)
+            direct = self.arena.walk_clear(pos, probe, stats["radius"], stats["height"])
+            route = [] if direct else self.arena.path(pos, target, seconds=0.003)
+            points = [pos[:2], *route, target]
+            route_distance = sum(math.dist(a, b) for a, b in pairwise(points))
+            detour = max(0, route_distance - length)
+            if not route and not direct:
+                detour = 12
+            cached = self.zone_route = t, tuple(pos[:2]), target, detour
+        return (
+            walk_eta + 9 + min(7, cached[3] / max(1, stats["walk_speed"])) >= remaining
+        )
 
     def safe_reload(self, obs, near, muzzle, act, danger, goal=None):
         me = obs["self"]
@@ -634,7 +736,9 @@ class Bot:
                 self.enemy_conflicts.add(index)
         self.free_for_all = len(self.enemy_conflicts) >= 2
 
-    def visible_target(self, enemies, muzzle, hp, yaw, t, charging, lightning, energy):
+    def visible_target(
+        self, enemies, muzzle, hp, yaw, t, charging, lightning, energy, me=None
+    ):
         candidates = []
         for enemy in enemies[:6]:
             x, y, z = enemy["pos"]
@@ -647,6 +751,9 @@ class Bot:
             health = enemy.get("hp", 1400)
             prey = max(0, 1 - health / 1400)
             score = distance - (65 if hp > 0.55 else 35) * prey
+            if me and 0 < health < 1400 and distance < 115 and not charging:
+                finish_time = self.time_to_eliminate(me, enemy, distance)
+                score -= 24 * max(0, 1 - finish_time / 3.5)
             bearing = math.atan2(y - muzzle[1], x - muzzle[0])
             score += 12 * abs(angle_delta(bearing, yaw))
             if enemy["id"] == self.focus_id:
@@ -669,6 +776,45 @@ class Bot:
                 break
         return min(candidates)[2] if candidates else None
 
+    def time_to_eliminate(self, me, enemy, distance):
+        health = enemy.get("hp", 1400)
+        cubes = self.config["cubes"]
+        damage_scale = (
+            1 + cubes["damage_per_cube"] * min(me["cubes"], cubes["stat_cap"])
+        ) * 0.85
+        best = math.inf
+        for weapon in me["weapons"]:
+            if not weapon or weapon["kind"] not in {"gun", "laser", "lightning"}:
+                continue
+            kind, stats = weapon["kind"], weapon["stats"]
+            if distance > stats["range"] * 0.94 or (
+                kind == "lightning" and me["energy"] < stats["energy"] + 5
+            ):
+                continue
+            shot_count = max(1, math.ceil(health / (stats["damage"] * damage_scale)))
+            eta = weapon["cooldown"] + (shot_count - 1) * stats["cooldown"]
+            if kind == "gun":
+                if weapon["reload"]:
+                    eta = (
+                        max(weapon["reload"], weapon["cooldown"])
+                        + (shot_count - 1) * stats["cooldown"]
+                    )
+                    ammo = stats["mag"]
+                else:
+                    ammo = weapon["ammo"]
+                eta += (
+                    max(0, math.ceil((shot_count - ammo) / stats["mag"]))
+                    * stats["reload"]
+                    + distance / stats["speed"]
+                )
+            elif kind == "laser":
+                eta += (
+                    max(0, stats["charge"] - weapon.get("charge", 0))
+                    + (shot_count - 1) * stats["charge"]
+                )
+            best = min(best, eta)
+        return best
+
     def destination(self, obs, hp, near, focus, urgent, retreat, threats):
         me, zone = obs["self"], obs["zone"]
         x, y, z = me["pos"]
@@ -686,7 +832,8 @@ class Bot:
             if inward > max(8, radius - 38):
                 return center, False
             return anchor, False
-        drop_goal = self.supply_goal(obs, hp, near)
+        emergency = retreat and self.capture_in_danger(hp, t)
+        drop_goal = None if emergency else self.supply_goal(obs, hp, near)
         if drop_goal is not None:
             return drop_goal, False
 
@@ -698,6 +845,24 @@ class Bot:
                 return backup, False
             cover = self.find_cover(obs, threats)
             if cover is not None:
+                if (
+                    math.dist((x, y), cover) < 1.6
+                    and self.recovery_exit
+                    and not self.can_heal_here(obs, threats)
+                ):
+                    backup = self.recovery_exit
+                    nearest = threats[0]["pos"][:2]
+                    if (
+                        math.dist(backup, nearest) > math.dist((x, y), nearest) + 2
+                        and self.retreat_zone_margin(obs, backup, 2.2) >= 6
+                        and self.arena.walk_clear(
+                            (x, y, z),
+                            backup,
+                            me["stats"]["radius"],
+                            me["stats"]["height"],
+                        )
+                    ):
+                        return backup, False
                 cube = self.cube_near_retreat_path(obs, cover, near)
                 return cube if cube is not None else cover, False
             ax, ay = 0.0, 0.0
@@ -1095,6 +1260,28 @@ class Bot:
                     return x, y
         return None
 
+    def can_heal_here(self, obs, threats):
+        me, t = obs["self"], obs["t"]
+        x, y, z = me["pos"]
+        body = (x, y, z + me["stats"]["height"] * 0.58)
+        horizon = max(0, me["stats"]["regen_delay"] - (t - self.last_combat)) + 0.8
+        for enemy in threats[:3]:
+            ex, ey, ez = enemy["pos"]
+            vx, vy = enemy["vel"][:2]
+            distance = math.hypot(x - ex, y - ey)
+            closing = ((x - ex) * vx + (y - ey) * vy) / max(1, distance)
+            if (
+                closing < 4
+                or abs(z - ez) > 8
+                or max(0, distance - 10) / closing >= horizon
+            ):
+                continue
+            step = min(0.75, horizon)
+            eye = ex + vx * step, ey + vy * step, ez + 7
+            if self.arena.clear((ex, ey, ez + 7), eye) and self.arena.clear(eye, body):
+                return False
+        return True
+
     def use_recovery_exit(self, obs, threats):
         me, t = obs["self"], obs["t"]
         if (
@@ -1181,7 +1368,9 @@ class Bot:
         drones = (e for e in obs["mechs"] if e["kind"] == "npc")
         return next((e for e in drones if math.dist(e["pos"], muzzle) < 33), None)
 
-    def choose_shot(self, target, me, muzzle, retreat, alive, t, urgent):
+    def choose_shot(
+        self, target, me, muzzle, retreat, alive, t, urgent, *, safe_to_charge=False
+    ):
         weapons = me["weapons"]
         if not target:
             charged = [
@@ -1217,7 +1406,12 @@ class Bot:
             kind_w = weapon["kind"]
             stats = weapon["stats"]
             charging = kind_w == "laser" and weapon.get("charge", 0) > 0
-            if kind_w == "laser" and t < self.laser_blocked_until:
+            if kind_w == "laser" and (
+                t < self.laser_blocked_until
+                or urgent
+                and not safe_to_charge
+                and not charging
+            ):
                 continue
             if weapon["cooldown"] > 0.32 and not charging:
                 continue
@@ -1313,6 +1507,9 @@ class Bot:
             if ready_gun is not None:
                 selected = ready_gun
         _, index, yaw, pitch, trigger, _ = selected
+        shared = self.shared_aim(selected, candidates, me)
+        if shared is not None:
+            return shared, [True, True]
         fire = [False, False]
         fire[index] = trigger
         for _, other, other_yaw, other_pitch, wants_fire, tol in candidates:
@@ -1325,6 +1522,35 @@ class Bot:
                     and (pitch_matches or weapons[other]["kind"] == "lightning")
                 )
         return (yaw, pitch), fire
+
+    def shared_aim(self, primary, candidates, me):
+        if len(candidates) != 2 or not primary[4]:
+            return None
+        other = next(option for option in candidates if option[1] != primary[1])
+        kinds = {weapon["kind"] for weapon in me["weapons"] if weapon}
+        if kinds != {"gun", "lightning"} or not other[4]:
+            return None
+        _, index, yaw, pitch, _, tolerance = primary
+        _, other_index, other_yaw, other_pitch, _, other_tolerance = other
+        delta = angle_delta(other_yaw, yaw)
+        if abs(delta) < other_tolerance and (
+            me["weapons"][other_index]["kind"] == "lightning"
+            or abs(other_pitch - pitch) < other_tolerance
+        ):
+            return None  # These shots already share the primary aim.
+        lower = max(-0.85 * tolerance, delta - 0.85 * other_tolerance)
+        upper = min(0.85 * tolerance, delta + 0.85 * other_tolerance)
+        if lower > upper:
+            return None
+        aim = math.remainder(yaw + clamp(0, lower, upper), math.tau)
+        gun_pitch = pitch if me["weapons"][index]["kind"] == "gun" else other_pitch
+        stats = me["stats"]
+        if (
+            abs(angle_delta(aim, me["aim"][0])) > stats["turn_rate"] * self.sim_step
+            or abs(gun_pitch - me["aim"][1]) > stats["pitch_rate"] * self.sim_step
+        ):
+            return None
+        return aim, gun_pitch
 
     def aim_at(self, kind, stats, point, velocity, muzzle, height):
         dx, dy, dz = (point[i] - muzzle[i] for i in range(3))
@@ -1457,6 +1683,13 @@ class Bot:
                 x + 2 * ux, y + 2 * uy, z, radius, height
             ):
                 fits = False
+            if (
+                fits
+                and me["grounded"]
+                and (urgent or retreat)
+                and (self.route or self.stuck >= 2)
+            ):
+                fits = self.corner_clear(pos, me["vel"], (ux, uy), radius, height)
             target_value = 3.6 * math.cos(offset) + (
                 0.06 * self.strafe if offset > 0 else 0.0
             )
@@ -1471,6 +1704,17 @@ class Bot:
         jump = me["grounded"] and self.stuck >= 5 and me["energy"] > 40 and distance > 9
         scale = max(0.32, min(1.0, distance / 9))
         return (best[1][0] * scale, best[1][1] * scale), jump
+
+    def corner_clear(self, position, velocity, direction, radius, height):
+        vx, vy = velocity[:2]
+        ux, uy = direction
+        momentum = math.hypot(vx, vy)
+        if momentum < 5 or (vx * ux + vy * uy) / momentum > 0.93:
+            return True
+        x = position[0] + 2.5 * ux + 0.13 * vx
+        y = position[1] + 2.5 * uy + 0.13 * vy
+        floor = max(self.arena.ground(x, y), position[2] - 0.5)
+        return self.arena.can_stand(x, y, floor, radius + 0.45, height)
 
     def projectile_risk(self, projectiles, position, velocity, radius):
         risk = 0.0
